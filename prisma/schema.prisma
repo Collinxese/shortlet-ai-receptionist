@@ -1,0 +1,456 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  OWNER
+  MANAGER
+  RECEPTIONIST
+}
+
+enum BookingStatus {
+  REQUESTED
+  HELD
+  CONFIRMED
+  EXPIRED
+  CANCELLED
+  PAYMENT_REVIEW
+  PAID_CONFLICT
+  REFUND_PENDING
+  REFUNDED
+  VERIFICATION_PENDING
+  REFUND_DUE
+}
+
+enum Channel {
+  WHATSAPP
+  INSTAGRAM
+  TIKTOK
+  WEBSITE
+}
+
+enum PaymentMethod {
+  MANUAL_TRANSFER
+  PAYSTACK_TEST
+}
+
+enum PaymentStatus {
+  INITIALIZING
+  PENDING
+  VERIFYING
+  SUCCEEDED
+  FAILED
+  REVIEW
+}
+
+enum WebhookProcessingStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  RETRY
+}
+
+model Tenant {
+  id                 String              @id @default(cuid())
+  name               String
+  timezone           String              @default("Africa/Lagos")
+  subscriptionStatus String              @default("trial")
+  aiQuotaMonthly     Int                 @default(0)
+  aiUsageThisPeriod  Int                 @default(0)
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  users              User[]
+  properties         Property[]
+  bookings           Booking[]
+  connections        ChannelConnection[]
+  conversations      Conversation[]
+  auditLogs          AuditLog[]
+  webhookEvents      WebhookEvent[]
+  sessions           AuthSession[]
+  priceRules         PriceRule[]
+  availabilityBlocks AvailabilityBlock[]
+  messages           Message[]
+  propertyFees       PropertyFee[]
+  bookingOperations  BookingOperation[]
+  payments           Payment[]
+  bankTransfer       BankTransferSetting?
+  conversationTurns ConversationTurn[]
+  escalations ConversationEscalation[]
+
+  @@index([subscriptionStatus])
+}
+
+model User {
+  id           String        @id @default(cuid())
+  tenantId     String
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  email        String        @unique
+  name         String
+  passwordHash String
+  role         UserRole      @default(RECEPTIONIST)
+  isActive     Boolean       @default(true)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  sessions     AuthSession[]
+  auditLogs    AuditLog[]
+  verifiedPayments Payment[] @relation("ManualVerifier")
+  resolvedEscalations ConversationEscalation[]
+
+  @@unique([tenantId, email])
+  @@unique([tenantId, id])
+  @@index([tenantId, role])
+}
+
+model AuthSession {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [tenantId, userId], references: [tenantId, id], onDelete: Cascade)
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([tenantId, userId])
+  @@index([expiresAt])
+}
+
+model Property {
+  id                      String              @id @default(cuid())
+  tenantId                String
+  tenant                  Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name                    String
+  area                    String
+  address                 String?
+  description             String?
+  maxGuests               Int
+  bedrooms                Int
+  bathrooms               Int                 @default(0)
+  amenities               String[]            @default([])
+  baseNightlyPriceKobo    BigInt
+  weekendNightlyPriceKobo BigInt?
+  cleaningFeeKobo         BigInt              @default(0)
+  currency                String              @default("NGN")
+  standardCheckIn         String              @default("12:00")
+  standardCheckOut        String              @default("12:00")
+  earlyCheckInFeeKobo     BigInt?
+  lateCheckOutFeeKobo     BigInt?
+  earlyCheckInAllowed     Boolean             @default(false)
+  earlyCheckInFrom        String?
+  earlyCheckInRules       String?
+  lateCheckOutAllowed     Boolean             @default(false)
+  lateCheckOutUntil       String?
+  lateCheckOutRules       String?
+  cancellationPolicy      String?
+  refundPolicy            String?
+  minimumStayNights       Int                 @default(1)
+  isActive                Boolean             @default(true)
+  createdAt               DateTime            @default(now())
+  updatedAt               DateTime            @updatedAt
+  bookings                Booking[]
+  availabilityBlocks      AvailabilityBlock[]
+  priceRules              PriceRule[]
+  otherFees               PropertyFee[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, isActive])
+  @@index([tenantId, area])
+}
+
+model PropertyFee {
+  id         String   @id @default(cuid())
+  tenantId   String
+  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  propertyId String
+  property   Property @relation(fields: [tenantId, propertyId], references: [tenantId, id], onDelete: Cascade)
+  label      String
+  amountKobo BigInt
+
+  @@unique([tenantId, propertyId, label])
+}
+
+model PriceRule {
+  id               String    @id @default(cuid())
+  tenantId         String
+  tenant           Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  propertyId       String
+  property         Property  @relation(fields: [tenantId, propertyId], references: [tenantId, id], onDelete: Cascade)
+  label            String
+  startDate        DateTime?
+  endDate          DateTime?
+  dayOfWeek        Int?
+  nightlyPriceKobo BigInt
+  priority         Int       @default(0)
+  createdAt        DateTime  @default(now())
+
+  @@index([tenantId, propertyId, startDate, endDate])
+}
+
+model AvailabilityBlock {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  propertyId  String
+  property    Property @relation(fields: [tenantId, propertyId], references: [tenantId, id], onDelete: Cascade)
+  startDate   DateTime
+  endDate     DateTime
+  reason      String
+  source      String   @default("operator")
+  externalUid String?
+  createdAt   DateTime @default(now())
+
+  @@unique([tenantId, propertyId, externalUid])
+  @@index([tenantId, propertyId, startDate, endDate])
+}
+
+model Booking {
+  id                   String             @id @default(cuid())
+  reference            String             @unique @default(cuid())
+  tenantId             String
+  tenant               Tenant             @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  propertyId           String
+  property             Property           @relation(fields: [tenantId, propertyId], references: [tenantId, id], onDelete: Restrict)
+  guestName            String?
+  guestPhone           String
+  checkIn              DateTime
+  checkOut             DateTime
+  guestCount           Int
+  status               BookingStatus      @default(REQUESTED)
+  quoteTotalKobo       BigInt
+  currency             String             @default("NGN")
+  holdExpiresAt        DateTime?
+  holdStartedAt        DateTime?
+  holdExtensionCount   Int                @default(0)
+  quoteSnapshot        Json?
+  paymentReference     String?            @unique
+  paymentTransactionId String?            @unique
+  paidAt               DateTime?
+  policySnapshot       Json?
+  cancellationReason   String?
+  version              Int                @default(0)
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+  operations           BookingOperation[]
+  payments             Payment[]
+  conversations        Conversation[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, propertyId, status, holdExpiresAt])
+  @@index([tenantId, status, checkIn, checkOut])
+  @@index([tenantId, guestPhone, status])
+  @@index([propertyId, status, checkIn, checkOut])
+}
+
+// Immutable creation responses allow exact replay even after the booking changes.
+model BookingOperation {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  operation String
+  key       String
+  inputHash String
+  bookingId String
+  booking   Booking  @relation(fields: [tenantId, bookingId], references: [tenantId, id], onDelete: Restrict)
+  response  Json
+  createdAt DateTime @default(now())
+
+  @@unique([tenantId, operation, key])
+  @@index([tenantId, bookingId])
+}
+
+model BankTransferSetting {
+  tenantId      String @id
+  tenant        Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  enabled       Boolean @default(false)
+  bankName      String
+  accountName   String
+  accountNumber String
+  updatedAt     DateTime @updatedAt
+}
+
+model Payment {
+  id                     String @id @default(cuid())
+  tenantId               String
+  tenant                 Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  bookingId              String
+  booking                Booking @relation(fields: [tenantId, bookingId], references: [tenantId, id], onDelete: Restrict)
+  reference              String @unique
+  method                 PaymentMethod
+  status                 PaymentStatus
+  expectedAmountKobo     BigInt
+  currency               String @default("NGN")
+  idempotencyKey         String
+  inputHash              String
+  customerEmail          String?
+  instructionsSnapshot   Json?
+  authorizationUrl       String?
+  providerReference      String? @unique
+  providerTransactionId  String? @unique
+  providerDetails        Json?
+  manualReceiptReference String?
+  receivedAmountKobo     BigInt?
+  receivedAt             DateTime?
+  verifiedAt             DateTime?
+  verifierId             String?
+  verifier               User? @relation("ManualVerifier", fields: [tenantId, verifierId], references: [tenantId, id], onDelete: Restrict)
+  reviewReason           String?
+  reviewNote             String?
+  appliedAt              DateTime?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+  conversations          Conversation[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, idempotencyKey])
+  @@unique([tenantId, manualReceiptReference])
+  @@index([tenantId, bookingId, status])
+  @@index([tenantId, status, createdAt])
+}
+
+model ChannelConnection {
+  id                    String    @id @default(cuid())
+  tenantId              String
+  tenant                Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  channel               Channel
+  externalBusinessId    String
+  externalPhoneNumberId String?
+  displayName           String?
+  encryptedCredential   String?
+  isActive              Boolean   @default(false)
+  lastVerifiedAt        DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@unique([channel, externalBusinessId])
+  @@index([tenantId, channel, isActive])
+}
+
+model Conversation {
+  id             String    @id @default(cuid())
+  tenantId       String
+  tenant         Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  channel        Channel
+  externalId     String
+  guestPhone     String?
+  guestName      String?
+  handlingMode   String    @default("AI")
+  needsAttention Boolean   @default(false)
+  lastMessageAt  DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  messages       Message[]
+  simulation     Boolean @default(false)
+  creationHash   String?
+  inquiry        Json @default("{}")
+  propertyOptions Json @default("[]")
+  quoteOffer     Json?
+  bookingId      String?
+  booking        Booking? @relation(fields: [tenantId, bookingId], references: [tenantId, id], onDelete: Restrict)
+  paymentId      String?
+  payment        Payment? @relation(fields: [tenantId, paymentId], references: [tenantId, id], onDelete: Restrict)
+  turns          ConversationTurn[]
+  escalations    ConversationEscalation[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, channel, externalId])
+  @@index([tenantId, needsAttention, lastMessageAt])
+  @@unique([tenantId, bookingId])
+  @@index([tenantId, simulation, updatedAt])
+}
+
+model Message {
+  id             String       @id @default(cuid())
+  tenantId       String
+  tenant         Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversationId String
+  conversation   Conversation @relation(fields: [tenantId, conversationId], references: [tenantId, id], onDelete: Cascade)
+  direction      String
+  body           String
+  providerId     String?
+  createdAt      DateTime     @default(now())
+  turnId         String?
+  turn           ConversationTurn? @relation(fields: [tenantId, conversationId, turnId], references: [tenantId, conversationId, id], onDelete: Cascade)
+
+  @@unique([providerId])
+  @@index([tenantId, conversationId, createdAt])
+  @@unique([tenantId, turnId, direction])
+}
+
+model ConversationTurn {
+  id String @id @default(cuid())
+  tenantId String
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversationId String
+  conversation Conversation @relation(fields: [tenantId, conversationId], references: [tenantId, id], onDelete: Cascade)
+  key String
+  inputHash String
+  status String @default("PROCESSING")
+  leaseToken String
+  leaseUntil DateTime
+  request Json
+  response Json?
+  createdAt DateTime @default(now())
+  completedAt DateTime?
+  messages Message[]
+  @@unique([tenantId, conversationId, id])
+  @@unique([tenantId, conversationId, key])
+  @@index([tenantId, conversationId, status])
+}
+
+model ConversationEscalation {
+  id String @id @default(cuid())
+  tenantId String
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversationId String
+  conversation Conversation @relation(fields: [tenantId, conversationId], references: [tenantId, id], onDelete: Cascade)
+  reason String
+  context Json
+  status String @default("OPEN")
+  createdAt DateTime @default(now())
+  resolvedAt DateTime?
+  resolvedById String?
+  resolvedBy User? @relation(fields: [tenantId, resolvedById], references: [tenantId, id], onDelete: Restrict)
+  @@index([tenantId, status, createdAt])
+  @@index([tenantId, conversationId, createdAt])
+}
+
+model WebhookEvent {
+  id          String                  @id @default(cuid())
+  tenantId    String?
+  tenant      Tenant?                 @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+  provider    String
+  eventId     String
+  eventType   String
+  rawBody     Json
+  status      WebhookProcessingStatus @default(RECEIVED)
+  receivedAt  DateTime                @default(now())
+  processedAt DateTime?
+  lastError   String?
+
+  @@unique([provider, eventId])
+  @@index([status, receivedAt])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  tenantId   String
+  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  actorId    String?
+  actor      User?    @relation(fields: [tenantId, actorId], references: [tenantId, id], onDelete: Restrict)
+  actorType  String
+  action     String
+  entityType String
+  entityId   String
+  before     Json?
+  after      Json?
+  reason     String?
+  createdAt  DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, entityType, entityId])
+}
