@@ -131,28 +131,39 @@ export class ConversationService {
         if (existing.status === 'COMPLETED') return { replay: existing.response };
         if (existing.leaseUntil > now) throw new HttpError(409,'TURN_IN_PROGRESS');
         const token = randomBytes(16).toString('hex');
+        // Recovered turns may predate stronger redaction. Minimize their text
+        // again before either persistence or another provider attempt.
+        const message = redactText((existing.request as { message: string }).message,conversation);
+        const savedPlan = (existing.request as { plan?: unknown }).plan;
         const turn = await tx.conversationTurn.update({ where: { id: existing.id, tenantId: this.tenantId },
-          data: { leaseToken: token, leaseUntil: new Date(now.getTime()+120000) } });
+          data: { leaseToken: token, leaseUntil: new Date(now.getTime()+120000), request: json({ message, ...(savedPlan ? { plan: savedPlan } : {}) }) } });
+        await tx.message.updateMany({ where: { tenantId: this.tenantId, conversationId: id, turnId: turn.id, direction: 'IN' }, data: { body: message } });
         return { conversation, turn };
       }
       const pending = await tx.conversationTurn.findFirst({ where: { tenantId: this.tenantId, conversationId: id, status: 'PROCESSING' } });
       if (pending) throw new HttpError(409,pending.leaseUntil > now ? 'TURN_IN_PROGRESS' : 'TURN_RECOVERY_REQUIRED');
       const { guestName, guestPhone, ...fields } = { ...extractGuestDetails(data.text), ...data.details };
       const inquiry = validInquiry({ ...validInquiry(conversation.inquiry), ...fields });
+      const options = conversation.propertyOptions as ConversationWork['propertyOptions'];
+      if (fields.propertyId && options.length > 1 && !options.some((option) => option.id === fields.propertyId)) {
+        throw new HttpError(400,'INVALID_PROPERTY_SELECTION');
+      }
       const changed = hash(tripValues(inquiry)) !== hash(tripValues(validInquiry(conversation.inquiry)));
       const quote = changed ? null : conversation.quoteOffer as QuoteOffer | null;
-      if (data.acceptQuoteId && (!quote || quote.id !== data.acceptQuoteId)) throw new HttpError(409,'QUOTE_ACCEPTANCE_INVALID');
-      if (quote && (data.acceptQuoteId === quote.id || isAgreement(data.text))) quote.accepted = true;
       const selection = /^(?:property\s+|option\s+|choose\s+)?([1-9]|10)[.!]?$/i.exec(data.text.trim());
       if (selection) {
-        const option = (conversation.propertyOptions as ConversationWork['propertyOptions'])[Number(selection[1])-1];
+        const option = options[Number(selection[1])-1];
         if (!option) throw new HttpError(400,'INVALID_PROPERTY_SELECTION');
         if (inquiry.propertyId !== option.id) { inquiry.propertyId = option.id; }
       }
       const selectedChanged = hash(tripValues(inquiry)) !== hash(tripValues(validInquiry(conversation.inquiry)));
+      const currentQuote = !selectedChanged && quote && hash(tripValues(inquiry)) === hash(tripValues(quote.trip)) ? quote : null;
+      const unexpired = currentQuote && Date.parse(currentQuote.expiresAt) > now.getTime();
+      if (data.acceptQuoteId && (!unexpired || currentQuote.id !== data.acceptQuoteId)) throw new HttpError(409,'QUOTE_ACCEPTANCE_INVALID');
+      if (unexpired && (data.acceptQuoteId === currentQuote.id || isAgreement(data.text))) currentQuote.accepted = true;
       const updated = await tx.conversation.update({ where: { id, tenantId: this.tenantId }, data: { inquiry,
         guestName: guestName ?? conversation.guestName, guestPhone: guestPhone ?? conversation.guestPhone,
-        quoteOffer: selectedChanged ? Prisma.DbNull : quote ? json(quote) : Prisma.DbNull, lastMessageAt: now } });
+        quoteOffer: currentQuote ? json(currentQuote) : Prisma.DbNull, lastMessageAt: now } });
       const message = redactText(data.text,{ guestName: updated.guestName, guestPhone: updated.guestPhone });
       const turn = await tx.conversationTurn.create({ data: { tenantId: this.tenantId, conversationId: id, key, inputHash: hash(data),
         leaseToken: randomBytes(16).toString('hex'), leaseUntil: new Date(now.getTime()+120000), request: { message } } });
@@ -170,9 +181,14 @@ export class ConversationService {
     else {
       let stage = 'model';
       try {
-        const context: ModelContext = { message, inquiry: work.inquiry, hasHold: Boolean(work.bookingId), hasQuote: Boolean(work.quoteOffer),
+        await active();
+        const inquiry = { ...work.inquiry,
+          ...(work.inquiry.area ? { area: redactText(work.inquiry.area,work) } : {}),
+          ...(work.inquiry.amenities ? { amenities: work.inquiry.amenities.map((value) => redactText(value,work)) } : {}) };
+        const context: ModelContext = { message, inquiry, hasHold: Boolean(work.bookingId), hasQuote: Boolean(work.quoteOffer),
           hasConsent: Boolean(work.quoteOffer?.accepted), hasName: Boolean(work.guestName), hasPhone: Boolean(work.guestPhone), today: lagosDate(this.clock()) };
-        const output = await this.modelPlan(context);
+        const savedPlan = (turn.request as { plan?: unknown }).plan;
+        const output = savedPlan ?? await this.modelPlan(context);
         const parsed = modelPlanSchema.safeParse(output);
         if (!parsed.success) throw new HttpError(409,'MODEL_INVALID_OUTPUT');
         const modelPlan = parsed.data;
@@ -186,6 +202,16 @@ export class ConversationService {
           if (!token) throw new HttpError(409,'TURN_LEASE_LOST');
           if (current.handlingMode !== 'AI') throw new HttpError(409,'CONVERSATION_TAKEN_OVER');
         };
+        if (savedPlan === undefined) {
+          // A reply/audit failure must not let a retry replace a search with a
+          // different model action against the previous accepted quote. Persist
+          // only the validated plan, under the same lease/takeover fence.
+          await this.db.$transaction(async (tx) => {
+            await guard(tx);
+            await tx.conversationTurn.update({ where: { id: turn.id, tenantId: this.tenantId },
+              data: { request: json({ message, plan: modelPlan }) } });
+          },txOptions);
+        }
         const linkBooking = async (tx: Prisma.TransactionClient, bookingId: string) => {
           await tx.conversation.update({ where: { id, tenantId: this.tenantId }, data: { bookingId } });
           await this.audit(tx,id,'conversation.booking_linked',{ bookingId, turnId: turn.id });
@@ -228,7 +254,8 @@ export class ConversationService {
       const fenced = await tx.conversationTurn.findFirst({ where: { id: turn.id, tenantId: this.tenantId, conversationId: id,
         status: 'PROCESSING', leaseToken: turn.leaseToken, leaseUntil: { gt: this.clock() } } });
       if (!fenced) throw new HttpError(409,'TURN_LEASE_LOST');
-      if (current.handlingMode !== 'AI' && conversation.handlingMode === 'AI') {
+      const takenOver = current.handlingMode !== 'AI' && conversation.handlingMode === 'AI';
+      if (takenOver) {
         reply = { body: 'Staff have taken over this conversation. Your message is saved; no automatic notification has been sent.' };
       }
       if (reply.escalation) {
@@ -239,9 +266,10 @@ export class ConversationService {
           await this.audit(tx,id,'conversation.escalated',{ reason: reply.escalation, turnId: turn.id, notificationSent: false });
         }
       }
-      const updated = await tx.conversation.update({ where: { id, tenantId: this.tenantId }, data: { inquiry: work.inquiry,
+      const updated = await tx.conversation.update({ where: { id, tenantId: this.tenantId }, data: { ...(!takenOver ? { inquiry: work.inquiry,
         propertyOptions: work.propertyOptions, quoteOffer: work.quoteOffer ? json(work.quoteOffer) : Prisma.DbNull,
-        bookingId: work.bookingId, paymentId: work.paymentId, ...(reply.escalation ? { needsAttention: true, handlingMode: 'HUMAN' } : {}), lastMessageAt: this.clock() } });
+        bookingId: work.bookingId, paymentId: work.paymentId } : {}),
+        ...(reply.escalation ? { needsAttention: true, handlingMode: 'HUMAN' } : {}), lastMessageAt: this.clock() } });
       const out = await tx.message.create({ data: { tenantId: this.tenantId, conversationId: id, turnId: turn.id, direction: 'OUT', body: reply.body } });
       const result = json({ conversation: this.response(updated), turnId: turn.id, message: { id: out.id, direction: 'OUT', body: out.body, createdAt: out.createdAt },
         action, facts: reply.facts ?? null, escalationRecorded: Boolean(reply.escalation), notificationSent: false });
@@ -256,6 +284,9 @@ export class ConversationService {
       const value = output[field];
       if (value === null) continue;
       const existing = work.inquiry[field];
+      if (field === 'propertyId' && work.propertyOptions.length > 1 && !work.propertyOptions.some((option) => option.id === value)) {
+        throw new HttpError(409,'MODEL_INVALID_OUTPUT');
+      }
       const values = Array.isArray(value) ? value : [String(value)];
       const supported = field === 'guestCount' ? new RegExp(`\\b${value}\\s*(?:guests?|people|persons?|adults?)\\b`,'i').test(message) :
         field === 'bedrooms' ? new RegExp(`\\b${value}\\s*bedrooms?\\b`,'i').test(message) : values.every((part) => message.toLowerCase().includes(part.toLowerCase()));

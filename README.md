@@ -321,6 +321,73 @@ Development checks caught quote-hash instability after JSONB key reordering, an 
 
 All database work used a newly initialized loopback-only disposable cluster; no application/production database was used. It was stopped and its test data removed after verification. Logs, the temporary probe and file manifest are retained at `/tmp/shortlet-phase5.ohfv7nki/`. Optional OpenAI tests use intercepted HTTP fixtures; no actual model, Paystack, paid sandbox completion, external webhook, live channel, notification or deployment was tested in Phase 5. Prior Phase 4.1 external acceptance limitations remain unchanged.
 
+### Phase 5 audit remediation — 2026-10-27
+
+Inspection began on a clean `main` at `1ecf04bf7534831f97e70a93bf813c4d148efb58` (`first commit`). Read-only GitHub inspection confirmed the same commit on `origin/main`. This remediation does not commit/push, deploy, add dependencies or start Phase 6.
+
+Confirmed application defects and fixes:
+
+- A new multi-result search retained the previous selected property; a single-result search retained its old quote/acceptance. Every search now clears selection, options and offer before querying, then selects only a sole result. Multiple results require a choice from the current options. Both request fields and model selections enforce that list; property-specific tools check it again. Numbered property changes invalidate the previous offer.
+- Explicit acceptance of an expired quote was allowed even though the hold tool subsequently refused to use it. Acceptance now requires matching current property/dates/count and an unexpired offer. Final hold creation also checks the offer deadline inside the existing core transaction, after lock waits; expiry rolls back the hold. The existing exact-terms hash, occupancy locks, quote snapshots and idempotency remain authoritative.
+- Guest text redaction missed common international numbers and introductions. Incoming messages and saved turn requests now minimize Nigerian/international phone formats, emails, common token/credential prefixes, card-like numbers and recognizable name introductions. Recovery minimizes pre-remediation pending requests again, including their incoming message, before planning. Model-facing area/amenity text is also minimized. Structured contact fields remain available to authorized booking operations and are excluded from model context.
+- After staff takeover won the conversation lock, a late model result could still save inquiry/options/quote changes while its reply was suppressed. Completion now discards that late AI work and only records the safe takeover acknowledgement and turn/audit bookkeeping. Existing transaction guards still prevent holds/payments after takeover or lease loss.
+- A failed search completion could leave the previous accepted quote in durable state. Replanning during lease recovery could then choose a hold for the old property: a regression reproduced an incorrect hold. The service now durably saves the validated action plan under its lease/takeover fence before tool execution and reuses it on recovery. A failed search repeats its search, not a new model-selected action. This uses the existing turn JSON; no schema change is required.
+
+Regressions assert API replies and actual PostgreSQL state for reselection, single/multiple options, obsolete acceptance, forced stale holds, new quotes/consent, expiry across a mutation boundary, international contact privacy with successful backend booking, historical pending-text recovery, late takeover edits, competing lease owners, booking/payment audit rollback, exact replay counts and failed-search recovery. Existing payment suites still cover exact amounts/currency/references/transaction identity/associations, reused provider IDs, signatures, duplicate deliveries, uncertain verification and late funds. A valid duplicate webhook reuses its previously verified result without another confirmation; reused funds or ambiguous outcomes cannot confirm another booking.
+
+Redaction remains heuristic. Unintroduced names, unusual formatting, obfuscation, other languages and some free-text personal information can be missed or misclassified. ISO dates, guest/bedroom counts and known booking/payment-reference formats have preservation tests; this is not a complete DLP guarantee. No mass rewrite of completed historical messages or useful databases was performed. Review existing retention, stored free-text/contact data and provider consent before external model use.
+
+Files changed:
+
+| File | Reason |
+| --- | --- |
+| `src/services/conversation-tools.ts` | Reset search state, enforce current selection and check offer expiry at mutation commit boundary |
+| `src/services/conversation-service.ts` | Bind acceptance to the current offer, minimize recovery/model context, persist validated plans and discard late AI changes after takeover |
+| `src/services/conversation-validation.ts` | Broader bounded contact/credential redaction and conservative contact extraction while preserving booking literals |
+| `test/conversation.test.ts` | Representative phone/name/token/card redaction and ordinary-message/date/reference preservation |
+| `test/integration/phase-five.test.ts` | Search/consent/privacy/recovery/takeover/lease/audit regressions against real disposable PostgreSQL |
+| `README.md`, `docs/BUILD_PLAN.md` | Findings, verification, limitations and explicit pre-production gates |
+| `.env` (ignored, local only) | Set `AI_PROVIDER=mock` and `PAYSTACK_TEST_ENABLED=false`; credential values are neither documented nor committed |
+
+No Prisma schema, historical migration, booking/payment lifecycle service, role rule, package manifest or lockfile was changed. Fresh migration deployment, upgrade/failure/recovery suites and a separate actual `migrate dev` probe exercise the existing seven-migration history. Before/after probe snapshots preserved all function definitions/settings, 69 constraints, six enabled application triggers and 78 indexes. The probe column/history exists only in temporary copies/disposable databases. `db push` is not a replacement for this SQL history.
+
+Dependency checks are **not clean**: both `npm audit --json` and `npm audit --omit=dev --json` returned exit 1 with three high entries (`prisma`, `@prisma/config`, `deepmerge-ts`) associated with one underlying recursive-merge stack-exhaustion advisory. The installed chain is Prisma 6.19.3 / @prisma/config 6.19.3 / deepmerge-ts 7.1.5. The [maintainer advisory](https://github.com/RebeccaStevens/deepmerge-ts/security/advisories/GHSA-ggr8-5vv4-36mx) describes recursive object graphs, rather than plain JSON, as the triggering input. A reachable application-route exploit was not established by this audit. npm proposes a major Prisma upgrade; no unreviewed major update/override was applied. Treat dependency remediation and deployment reachability review as an outstanding production gate.
+
+No live AI request, payment-provider API request, real payment, external guest message, notification, deployment or production database mutation occurred. Registry auditing, official security-advisory reading and read-only GitHub inspection were the external checks. Real OpenAI model acceptance, paid Paystack checkout and external webhook delivery remain unverified. Tenant quotas, overages, monthly limits and model-pricing decisions were not implemented; their budget/product design requires a separate deliberate step. Staff notifications, public guest/channel identity, shared abuse controls and retained-data review remain pre-production work.
+
+Final remediation verification (2026-10-27): build exit 0; **40 unit tests passed**; the final full integration run exited 0 with **143 tests passed, zero failures/cancellations/skips**. It includes 29 Phase 5 conversation checks (including the parent test), the two Phase 5 migration checks and every existing earlier-phase suite. The final source also passed `git diff --check`.
+
+Exact principal verification commands (output redirected to the audit logs; all database URLs below were disposable loopback-only databases):
+
+```sh
+AI_PROVIDER=mock PAYSTACK_TEST_ENABLED=false npm run build
+AI_PROVIDER=mock PAYSTACK_TEST_ENABLED=false npm test
+AI_PROVIDER=mock PAYSTACK_TEST_ENABLED=false TEST_DATABASE_URL='postgresql://phase5_audit@127.0.0.1:55447/phase5_audit_test?schema=public' npm run test:integration
+DATABASE_URL='postgresql://phase5_audit@127.0.0.1:55447/phase5_audit_verified?schema=public' npm run db:generate
+DATABASE_URL='postgresql://phase5_audit@127.0.0.1:55447/phase5_audit_verified?schema=public' npm run db:deploy
+DATABASE_URL='postgresql://phase5_audit@127.0.0.1:55447/phase5_audit_verified?schema=public' npx prisma validate
+DATABASE_URL='postgresql://phase5_audit@127.0.0.1:55447/phase5_audit_verified?schema=public' npx prisma migrate status
+DATABASE_URL='postgresql://phase5_audit@127.0.0.1:55447/phase5_audit_verified?schema=public' npx prisma migrate diff --from-url 'postgresql://phase5_audit@127.0.0.1:55447/phase5_audit_verified?schema=public' --to-schema-datamodel prisma/schema.prisma --exit-code
+npm audit --json
+AI_PROVIDER=mock PAYSTACK_TEST_ENABLED=false npm audit --omit=dev --json
+npm ls prisma @prisma/config deepmerge-ts --all
+```
+
+Generation/deployment/validation/status/diff all exited 0: client generated, seven migrations applied, schema valid/up to date, and no representable differences. `npm ls` exited 0. Both audit commands exited 1 with the three high entries described above; security auditing is not reported as passing.
+
+The separate migration probe exited 0 with these commands against a temporary schema/history copy:
+
+```sh
+DATABASE_URL='postgresql://phase5_audit@127.0.0.1:55447/phase5_audit_probe?schema=public' SHADOW_DATABASE_URL='postgresql://phase5_audit@127.0.0.1:55447/phase5_audit_shadow?schema=public' npx prisma migrate deploy --schema /tmp/shortlet-phase5-audit.dht4p207/migration-probe/schema.prisma
+DATABASE_URL='postgresql://phase5_audit@127.0.0.1:55447/phase5_audit_probe?schema=public' SHADOW_DATABASE_URL='postgresql://phase5_audit@127.0.0.1:55447/phase5_audit_shadow?schema=public' npx prisma migrate dev --schema /tmp/shortlet-phase5-audit.dht4p207/migration-probe/schema.prisma --name phase5_remediation_guard_probe --skip-generate
+```
+
+Catalog comparisons verified unchanged function definitions/settings, constraints, enabled triggers and indexes after the generated nullable probe column. All seven historical migrations, Prisma schema and package files match their initial SHA-256 hashes. The existing populated-upgrade and injected-failure/resolve/retry tests passed in the full suite. No new migration or dependency installation is required for these application fixes.
+
+Failure evidence is retained, not counted as success: the initial new focused integration regressions reported 19 passes/7 failures (six failed subtests plus their parent), and focused unit tests reported 8 passes/1 failure. An intermediate privacy test incorrectly expected a model call after a credential was detected; it now separately checks contact minimization and the intended credential escalation. A later failed-search recovery regression reported 27 passes/2 failures (one failed subtest plus parent) and actually created one incorrect old-property hold in its disposable fixture. Saving/replaying the validated plan fixed it. An intermediate full run passed 142 tests before that additional regression; the final full rerun passed 143. The first test-cluster initialization failed on the host's locale setting; retrying `LC_ALL=C initdb -D /tmp/shortlet-phase5-audit.dht4p207/data -A trust -U phase5_audit --encoding=UTF8 --locale=C` succeeded. No tests were skipped or omitted because of this setup issue.
+
+Audit artifacts are retained at `/tmp/shortlet-phase5-audit.dht4p207/`, including pre-fix failures, final results, dependency JSON, catalog snapshots and file manifest. The disposable PostgreSQL cluster was stopped and its data removed after verification; these example URLs are not running services. The existing `.gitignore` excludes `docs/` and `.env`: the build-plan update is local unless explicitly included in a later documentation commit, and credentials must remain ignored. Remediation changes remain uncommitted for review. Production readiness is not declared, and Phase 6 was not started.
+
 ## Tests
 
 ### Phase 4.1 acceptance audit — 2026-10-26

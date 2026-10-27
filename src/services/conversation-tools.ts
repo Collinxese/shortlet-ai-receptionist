@@ -64,6 +64,11 @@ export class ConversationTools {
     await this.assertActive();
     switch (request.name) {
       case 'search_properties': {
+        // Every search starts a new choice. Even an empty/failed search must not
+        // leave an old accepted offer or selection available to a later action.
+        delete this.work.inquiry.propertyId;
+        this.work.quoteOffer = null;
+        this.work.propertyOptions = [];
         const properties = await this.repository.searchProperties(request.args);
         this.work.propertyOptions = properties.map((p) => ({ id: p.id, name: propertyText(p.name,120), area: propertyText(p.area,120) }));
         if (!properties.length) return { body: 'I could not find an active property matching those requirements. Staff assistance has been recorded; no notification has been sent.', escalation: 'NO_AVAILABILITY' };
@@ -73,6 +78,7 @@ export class ConversationTools {
           facts: { properties: this.work.propertyOptions, reserved: false, availabilityNotChecked: true } };
       }
       case 'get_property_details': {
+        this.requireSelection(request.args.propertyId);
         const p = await this.repository.property(request.args.propertyId);
         if (!p.isActive) throw new HttpError(404,'NOT_FOUND');
         const facts = { id: p.id, name: propertyText(p.name,120), area: propertyText(p.area,120), address: propertyText(p.address),
@@ -85,6 +91,7 @@ export class ConversationTools {
           facts, ...(!p.cancellationPolicy || !p.refundPolicy ? { escalation: 'MISSING_CONFIGURATION' as const } : {}) };
       }
       case 'check_availability': {
+        this.requireSelection(request.args.propertyId);
         const p = await this.repository.property(request.args.propertyId);
         const available = await this.repository.availability(p.id, { checkIn: request.args.checkIn, checkOut: request.args.checkOut });
         const fits = p.maxGuests >= request.args.guestCount;
@@ -96,6 +103,12 @@ export class ConversationTools {
       case 'get_quote': return this.quote(request.args);
       case 'create_booking_hold': {
         if (this.work.bookingId) return this.bookingStatus();
+        if (!this.work.inquiry.propertyId || (this.work.propertyOptions.length > 1 &&
+          !this.work.propertyOptions.some((option) => option.id === this.work.inquiry.propertyId))) {
+          delete this.work.inquiry.propertyId;
+          this.work.quoteOffer = null;
+          return { body: 'Please choose one of the current property options, then review and accept its quote before creating a hold.' };
+        }
         const offer = this.work.quoteOffer;
         if (!offer || !offer.accepted) return { body: 'Please review a current backend quote and explicitly accept it before I create a hold.' };
         if (Date.parse(offer.expiresAt) <= this.clock().getTime()) return this.quote({ propertyId: this.work.inquiry.propertyId,
@@ -107,7 +120,12 @@ export class ConversationTools {
           trip.guestCount !== offer.trip.guestCount) throw new HttpError(409,'QUOTE_CHANGED_REVIEW_REQUIRED');
         // Reuse core idempotency and commit the conversation link in the hold transaction.
         const result = await this.bookings.create('HELD', { ...trip, guestName: this.work.guestName, guestPhone: this.work.guestPhone },
-          `conversation-hold:${this.work.id}`, offer.hash, this.mutationGuard, this.linkBooking) as { id: string };
+          `conversation-hold:${this.work.id}`, offer.hash, this.mutationGuard, async (tx, bookingId) => {
+            // Property/phone locks may have waited past the offer deadline. This
+            // final check rolls back the hold before either link/audit commits.
+            if (Date.parse(offer.expiresAt) <= this.clock().getTime()) throw new HttpError(409,'QUOTE_CHANGED_REVIEW_REQUIRED');
+            await this.linkBooking?.(tx,bookingId);
+          }) as { id: string };
         this.work.bookingId = id.parse(result.id);
         return this.bookingStatus();
       }
@@ -131,9 +149,14 @@ export class ConversationTools {
       case 'request_human_assistance': return { body: 'Your request is recorded for staff review with this conversation. No automatic notification has been sent.', escalation: 'GUEST_REQUEST' };
     }
   }
+  private requireSelection(propertyId: string) {
+    if (this.work.inquiry.propertyId !== propertyId || (this.work.propertyOptions.length > 1 &&
+      !this.work.propertyOptions.some((option) => option.id === propertyId))) throw new HttpError(409,'PROPERTY_SELECTION_REQUIRED');
+  }
   private async quote(input: unknown): Promise<ToolReply> {
     if (this.work.bookingId) return this.bookingStatus();
     const trip = tripSchema.parse(input);
+    this.requireSelection(trip.propertyId);
     const snapshot = await this.bookings.quote(trip);
     checkPropertyData(snapshot);
     if (!snapshot.property.cancellationPolicy?.trim() || !snapshot.property.refundPolicy?.trim()) throw new HttpError(409,'POLICY_CONFIGURATION_MISSING');

@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import type { HTTPMethods } from 'fastify';
 import { buildApp } from '../../src/app.js';
 import { loadConfig } from '../../src/config.js';
@@ -8,6 +9,7 @@ import { MockConversationModel, type ModelContext } from '../../src/services/con
 import { plan } from '../../src/services/conversation-validation.js';
 import { ConversationService } from '../../src/services/conversation-service.js';
 import { publicUserSelect } from '../../src/services/authentication.js';
+import { ConversationTools, type ConversationWork } from '../../src/services/conversation-tools.js';
 import { isolatedDatabase } from './database.js';
 
 test('Phase 5 simulated conversations, tools, recovery and guest isolation on disposable PostgreSQL', async (t) => {
@@ -94,6 +96,165 @@ test('Phase 5 simulated conversations, tools, recovery and guest isolation on di
     assert.equal((await send(conversation.id,'Invalid dates',{ checkIn: '2027-02-08', checkOut: '2027-02-05' })).statusCode,400);
     assert.equal((await request('POST','/simulations/conversations',a,{ tenantId: b.user.tenantId },'bad-tenant-create')).statusCode,400);
     assert.equal((await request('POST',`/simulations/conversations/${conversation.id}/messages`,a,{ text: 'hello', tenantId: b.user.tenantId },'bad-tenant-turn')).statusCode,400);
+  });
+
+  await t.test('a new multi-result search drops the old selection and consent until a current option is chosen', async () => {
+    const old = await agreed();
+    const area = `Replacement area ${++sequence}`;
+    const next = await room(a,{ area, name: 'Replacement B' }), other = await room(a,{ area, name: 'Replacement C' });
+    override = async () => plan('collect_details');
+    try { await send(old.conversation.id,'I agree'); } finally { override = undefined; }
+    override = async () => plan('search_properties');
+    let searched;
+    try { searched = await send(old.conversation.id,'Search again',{ area }); } finally { override = undefined; }
+    assert.equal(searched.statusCode,200,searched.body);
+    assert.match(searched.json().message.body,/Which property/);
+    assert.equal(searched.json().conversation.inquiry.propertyId,undefined);
+    const row = await db.conversation.findUniqueOrThrow({ where: { id: old.conversation.id } });
+    assert.equal(row.quoteOffer,null); assert.equal((row.inquiry as { propertyId?: string }).propertyId,undefined);
+    assert.equal((await send(old.conversation.id,'I agree',{},a,undefined,old.offer.facts.quoteId)).statusCode,409);
+    override = async () => plan('create_booking_hold');
+    try { assert.match((await send(old.conversation.id,'Please create a hold')).json().message.body,/choose|quote|accept/i); }
+    finally { override = undefined; }
+    override = async () => plan('get_quote');
+    try { assert.equal((await send(old.conversation.id,'Quote please')).json().facts,null); }
+    finally { override = undefined; }
+    assert.equal(await db.booking.count({ where: { propertyId: { in: [old.property.id,next.id,other.id] } } }),0);
+    assert.equal((await send(old.conversation.id,'Select previous property',{ propertyId: old.property.id })).statusCode,400);
+    const options = searched.json().facts.properties as { id: string }[];
+    const index = options.findIndex((p) => p.id === next.id);
+    const selected = await send(old.conversation.id,String(index+1));
+    assert.equal(selected.statusCode,200,selected.body);
+    assert.equal(selected.json().conversation.inquiry.propertyId,next.id);
+    const fresh = selected.json().facts?.quoteId ? selected.json() : await quote(old.conversation.id);
+    assert.notEqual(fresh.facts.quoteId,old.offer.facts.quoteId);
+    assert.equal((await send(old.conversation.id,'I agree',{},a,undefined,old.offer.facts.quoteId)).statusCode,409);
+    const held = await send(old.conversation.id,'I agree',{},a,undefined,fresh.facts.quoteId);
+    assert.equal(held.statusCode,200,held.body); assert.equal(held.json().facts.status,'HELD');
+    const booking = await db.booking.findUniqueOrThrow({ where: { id: held.json().facts.bookingId } });
+    assert.equal(booking.propertyId,next.id); assert.equal(booking.status,'HELD');
+    assert.equal(await db.booking.count({ where: { propertyId: old.property.id } }),0);
+  });
+
+  await t.test('a single-result search clears the previous accepted quote and cannot hold either property without fresh consent', async () => {
+    const old = await agreed();
+    const replacement = await room(a,{ area: `Single replacement ${++sequence}` });
+    override = async () => plan('collect_details');
+    try { await send(old.conversation.id,'I agree'); } finally { override = undefined; }
+    override = async () => plan('search_properties');
+    try {
+      const result = await send(old.conversation.id,'Search again',{ area: replacement.area });
+      assert.equal(result.statusCode,200,result.body); assert.equal(result.json().conversation.inquiry.propertyId,replacement.id);
+    } finally { override = undefined; }
+    assert.equal((await db.conversation.findUniqueOrThrow({ where: { id: old.conversation.id } })).quoteOffer,null);
+    assert.equal((await send(old.conversation.id,'I agree',{},a,undefined,old.offer.facts.quoteId)).statusCode,409);
+    override = async () => plan('create_booking_hold');
+    try { assert.match((await send(old.conversation.id,'I agree')).json().message.body,/quote|accept/i); }
+    finally { override = undefined; }
+    assert.equal(await db.booking.count({ where: { propertyId: { in: [old.property.id,replacement.id] } } }),0);
+    const fresh = await quote(old.conversation.id);
+    assert.equal(fresh.facts.snapshot.property.id,replacement.id);
+    assert.equal((await send(old.conversation.id,'I agree',{},a,undefined,fresh.facts.quoteId)).json().facts.status,'HELD');
+  });
+
+  await t.test('switching numbered options invalidates the selected property quote and rejects model selections outside current options', async () => {
+    const area = `Options area ${++sequence}`;
+    const one = await room(a,{ area }), two = await room(a,{ area });
+    const conversation = await create({ ...trip(one.id), area, ...contact() });
+    override = async () => plan('search_properties');
+    try { await send(conversation.id,'Search'); } finally { override = undefined; }
+    const options = (await db.conversation.findUniqueOrThrow({ where: { id: conversation.id } })).propertyOptions as { id: string }[];
+    assert.equal(options.length,2);
+    await send(conversation.id,'1');
+    const first = await quote(conversation.id);
+    override = async () => plan('collect_details');
+    try { await send(conversation.id,'I agree'); await send(conversation.id,'2'); } finally { override = undefined; }
+    const saved = await db.conversation.findUniqueOrThrow({ where: { id: conversation.id } });
+    assert.equal((saved.inquiry as { propertyId: string }).propertyId,options[1]!.id); assert.equal(saved.quoteOffer,null);
+    assert.equal((await send(conversation.id,'I agree',{},a,undefined,first.facts.quoteId)).statusCode,409);
+    override = async () => plan('get_quote',{ propertyId: property.id });
+    try {
+      const denied = await send(conversation.id,`Quote property ${property.id}`);
+      assert.equal(denied.json().facts,null); assert.equal(denied.json().escalationRecorded,true);
+    } finally { override = undefined; }
+    assert.equal(await db.booking.count({ where: { propertyId: { in: [one.id,two.id] } } }),0);
+  });
+
+  await t.test('explicit acceptance of an expired quote is rejected without persisting consent', async () => {
+    const { conversation, offer, property: p } = await agreed();
+    const saved = await db.conversation.findUniqueOrThrow({ where: { id: conversation.id } });
+    await db.conversation.update({ where: { id: conversation.id }, data: { quoteOffer: {
+      ...(saved.quoteOffer as object), expiresAt: new Date(Date.now()-1).toISOString()
+    } } });
+    const result = await send(conversation.id,'I agree',{},a,undefined,offer.facts.quoteId);
+    assert.equal(result.statusCode,409,result.body); assert.equal(result.json().error,'QUOTE_ACCEPTANCE_INVALID');
+    assert.equal(((await db.conversation.findUniqueOrThrow({ where: { id: conversation.id } })).quoteOffer as { accepted: boolean }).accepted,false);
+    assert.equal(await db.booking.count({ where: { propertyId: p.id } }),0);
+  });
+
+  await t.test('international contacts and common introductions never reach stored incoming text or planner context', async () => {
+    const p = await room(), conversation = await create(trip(p.id));
+    const privateValues = ['Amara Okafor','+44 7700 900123','amara@example.com'];
+    const text = `I'm ${privateValues[0]}, phone ${privateValues[1]}, email ${privateValues[2]}. For 2 guests, 2027-02-05 to 2027-02-08.`;
+    override = async () => plan('collect_details');
+    try { assert.equal((await send(conversation.id,text,{ area: `Lekki ${privateValues[1]}` })).statusCode,200); } finally { override = undefined; }
+    const history = await request('GET',`/conversations/${conversation.id}/messages`,a);
+    const turn = await db.conversationTurn.findFirstOrThrow({ where: { conversationId: conversation.id } });
+    for (const value of privateValues) {
+      assert.equal(history.body.includes(value),false,value);
+      assert.equal(JSON.stringify(turn.request).includes(value),false,value);
+      assert.equal(JSON.stringify(contexts.at(-1)).includes(value),false,value);
+    }
+    assert.match(contexts.at(-1)!.message,/2 guests, 2027-02-05 to 2027-02-08/);
+    const saved = await db.conversation.findUniqueOrThrow({ where: { id: conversation.id } });
+    assert.equal(saved.guestName,'Amara Okafor'); assert.equal(saved.guestPhone,'+447700900123');
+    const offer = await quote(conversation.id);
+    const held = await send(conversation.id,'I agree',{},a,undefined,offer.facts.quoteId);
+    assert.equal(held.json().facts.status,'HELD');
+    const booking = await db.booking.findUniqueOrThrow({ where: { id: held.json().facts.bookingId } });
+    assert.equal(booking.guestName,'Amara Okafor'); assert.equal(booking.guestPhone,'+447700900123');
+    const credential = 'ghp_SyntheticCredential12345678901234567890', calls = contexts.length;
+    const secret = await send(conversation.id,`Access token: ${credential}`);
+    assert.equal(secret.json().escalationRecorded,true); assert.equal(contexts.length,calls);
+    assert.equal((await request('GET',`/conversations/${conversation.id}/messages`,a)).body.includes(credential),false);
+    assert.equal(JSON.stringify(await db.conversationTurn.findMany({ where: { conversationId: conversation.id }, select: { request: true } })).includes(credential),false);
+  });
+
+  await t.test('crossing the quote deadline inside the core mutation transaction rolls the hold back', async () => {
+    const { conversation, property: p } = await agreed();
+    override = async () => plan('collect_details');
+    try { await send(conversation.id,'I agree'); } finally { override = undefined; }
+    const row = await db.conversation.findUniqueOrThrow({ where: { id: conversation.id } });
+    const work = { id: row.id, inquiry: row.inquiry, guestName: row.guestName, guestPhone: row.guestPhone,
+      propertyOptions: row.propertyOptions, quoteOffer: row.quoteOffer, bookingId: row.bookingId, paymentId: row.paymentId } as ConversationWork;
+    const user = await db.user.findUniqueOrThrow({ where: { id: a.user.id }, select: publicUserSelect });
+    let now = new Date();
+    const tools = new ConversationTools(db,{ user, sessionId: 'synthetic-deadline-test' },work,async () => {},() => now,
+      async () => { now = new Date(Date.parse(work.quoteOffer!.expiresAt)+1); });
+    await assert.rejects(tools.run({ name: 'create_booking_hold', args: {} }),/QUOTE_CHANGED_REVIEW_REQUIRED/);
+    assert.equal(await db.booking.count({ where: { propertyId: p.id } }),0);
+    assert.equal(await db.bookingOperation.count({ where: { key: `conversation-hold:${conversation.id}` } }),0);
+    assert.equal((await db.conversation.findUniqueOrThrow({ where: { id: conversation.id } })).bookingId,null);
+  });
+
+  await t.test('reclaiming a pre-remediation turn redacts its saved request and incoming message before the planner runs', async () => {
+    const conversation = await create();
+    const text = 'This is Amara Okafor, phone +1 (202) 555-0123. For 2 guests.', key = 'phase5-legacy-contact-recovery';
+    const turn = await db.conversationTurn.create({ data: { tenantId: a.user.tenantId, conversationId: conversation.id, key,
+      inputHash: createHash('sha256').update(JSON.stringify({ text, details: {} })).digest('hex'), leaseToken: 'a'.repeat(32),
+      leaseUntil: new Date(Date.now()-1), request: { message: text } } });
+    await db.message.create({ data: { tenantId: a.user.tenantId, conversationId: conversation.id, turnId: turn.id, direction: 'IN', body: text } });
+    override = async () => plan('collect_details');
+    let result;
+    try { result = await send(conversation.id,text,{},a,key); } finally { override = undefined; }
+    assert.equal(result.statusCode,200,result.body);
+    const stored = await db.conversationTurn.findUniqueOrThrow({ where: { id: turn.id } });
+    const history = await request('GET',`/conversations/${conversation.id}/messages`,a);
+    for (const value of ['Amara Okafor','+1 (202) 555-0123']) {
+      assert.equal(JSON.stringify(stored.request).includes(value),false);
+      assert.equal(history.body.includes(value),false); assert.equal(JSON.stringify(contexts.at(-1)).includes(value),false);
+    }
+    assert.equal(await db.message.count({ where: { turnId: turn.id } }),2);
   });
 
   await t.test('model cannot grant agreement; explicit quote acceptance creates one hold and replays exact responses', async () => {
@@ -348,6 +509,118 @@ test('Phase 5 simulated conversations, tools, recovery and guest isolation on di
     assert.equal(await db.booking.count({ where: { propertyId: p.id } }),1);
     assert.equal(await db.message.count({ where: { turnId: pending.id } }),2);
     assert.equal(await db.auditLog.count({ where: { entityId: recovered.json().facts.bookingId, action: 'booking.held' } }),1);
+  });
+
+  await t.test('takeover also discards late model inquiry/quote edits while completing safe turn bookkeeping', async () => {
+    const { conversation } = await agreed();
+    let release!: () => void, entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    override = async () => { entered(); await new Promise<void>((resolve) => { release = resolve; }); return plan('get_quote',{ amenities: ['Wi-Fi'] }); };
+    const running = send(conversation.id,'Please add Wi-Fi');
+    let atTakeover;
+    try {
+      await started;
+      assert.equal((await request('PATCH',`/conversations/${conversation.id}/handling`,manager,{ mode: 'HUMAN' })).statusCode,200);
+      atTakeover = await db.conversation.findUniqueOrThrow({ where: { id: conversation.id } });
+    } finally { release(); override = undefined; }
+    const result = await running;
+    assert.equal(result.statusCode,200,result.body); assert.match(result.json().message.body,/taken over/);
+    const after = await db.conversation.findUniqueOrThrow({ where: { id: conversation.id } });
+    assert.deepEqual(after.inquiry,atTakeover!.inquiry); assert.deepEqual(after.quoteOffer,atTakeover!.quoteOffer);
+    assert.deepEqual(after.propertyOptions,atTakeover!.propertyOptions); assert.equal(after.handlingMode,'HUMAN');
+    assert.equal(result.json().facts,null); assert.equal(await db.conversationTurn.count({ where: { conversationId: conversation.id, status: 'PROCESSING' } }),0);
+  });
+
+  await t.test('a reclaimed lease fences a still-running old worker and permits exactly one hold and reply', async () => {
+    const { conversation, property: p } = await agreed();
+    let release!: () => void, entered!: () => void, calls = 0;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    override = async () => {
+      if (++calls === 1) { entered(); await new Promise<void>((resolve) => { release = resolve; }); }
+      return plan('create_booking_hold');
+    };
+    const key = 'phase5-audit-reclaimed-lease';
+    const stale = send(conversation.id,'I agree',{},a,key);
+    let replacement;
+    try {
+      await started;
+      const pending = await db.conversationTurn.findFirstOrThrow({ where: { conversationId: conversation.id, status: 'PROCESSING' } });
+      await db.conversationTurn.update({ where: { id: pending.id }, data: { leaseUntil: new Date(Date.now()-1) } });
+      replacement = await send(conversation.id,'I agree',{},a,key);
+      assert.equal(replacement.statusCode,200,replacement.body); assert.equal(replacement.json().facts.status,'HELD');
+    } finally { release(); override = undefined; }
+    const rejected = await stale;
+    assert.equal(rejected.statusCode,409,rejected.body); assert.equal(rejected.json().error,'TURN_LEASE_LOST');
+    const turn = await db.conversationTurn.findFirstOrThrow({ where: { conversationId: conversation.id, key } });
+    assert.equal(turn.status,'COMPLETED'); assert.equal(await db.message.count({ where: { turnId: turn.id } }),2);
+    assert.equal(await db.booking.count({ where: { propertyId: p.id } }),1);
+    assert.equal(await db.auditLog.count({ where: { action: 'conversation.turn_completed', after: { path: ['turnId'], equals: turn.id } } }),1);
+    assert.deepEqual((await send(conversation.id,'I agree',{},a,key)).json(),replacement!.json());
+  });
+
+  await t.test('core booking/payment link audit failures roll back mutations and successful retries stay idempotent', async () => {
+    const { conversation, property: p } = await agreed();
+    const fail = async (action: string) => {
+      await db.$executeRawUnsafe(`CREATE FUNCTION phase5_fail_core_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action='${action}' THEN RAISE EXCEPTION 'synthetic core audit failure'; END IF; RETURN NEW; END $$`);
+      await db.$executeRawUnsafe('CREATE TRIGGER phase5_fail_core_audit BEFORE INSERT ON "AuditLog" FOR EACH ROW EXECUTE FUNCTION phase5_fail_core_audit()');
+    };
+    const restore = async () => {
+      await db.$executeRawUnsafe('DROP TRIGGER phase5_fail_core_audit ON "AuditLog"');
+      await db.$executeRawUnsafe('DROP FUNCTION phase5_fail_core_audit()');
+    };
+    await fail('conversation.booking_linked');
+    try { assert.equal((await send(conversation.id,'I agree')).json().escalationRecorded,true); } finally { await restore(); }
+    assert.equal(await db.booking.count({ where: { propertyId: p.id } }),0);
+    assert.equal((await db.conversation.findUniqueOrThrow({ where: { id: conversation.id } })).bookingId,null);
+    assert.equal(await db.bookingOperation.count({ where: { key: `conversation-hold:${conversation.id}` } }),0);
+    await request('PATCH',`/conversations/${conversation.id}/handling`,manager,{ mode: 'AI' });
+    const held = await send(conversation.id,'I agree'); assert.equal(held.json().facts.status,'HELD');
+    const bookingId = held.json().facts.bookingId;
+    await fail('conversation.payment_linked');
+    try { assert.equal((await send(conversation.id,'Payment instructions')).json().escalationRecorded,true); } finally { await restore(); }
+    assert.equal(await db.payment.count({ where: { bookingId } }),0);
+    assert.equal((await db.conversation.findUniqueOrThrow({ where: { id: conversation.id } })).paymentId,null);
+    await request('PATCH',`/conversations/${conversation.id}/handling`,manager,{ mode: 'AI' });
+    const key = 'phase5-core-payment-retry';
+    const paid = await send(conversation.id,'Payment instructions',{},a,key);
+    assert.equal(paid.statusCode,200,paid.body); assert.equal(paid.json().facts.status,'PENDING');
+    const before = { messages: await db.message.count({ where: { conversationId: conversation.id } }), audits: await db.auditLog.count() };
+    assert.deepEqual((await send(conversation.id,'Payment instructions',{},a,key)).json(),paid.json());
+    assert.equal(await db.payment.count({ where: { bookingId } }),1);
+    assert.equal(await db.message.count({ where: { conversationId: conversation.id } }),before.messages);
+    assert.equal(await db.auditLog.count(),before.audits);
+    assert.equal(await db.auditLog.count({ where: { entityId: bookingId, action: 'booking.held' } }),1);
+    assert.equal(await db.auditLog.count({ where: { entityId: paid.json().facts.paymentId, action: 'payment.initiated' } }),1);
+  });
+
+  await t.test('recovering a failed search replays its validated action instead of replanning a hold on the old accepted quote', async () => {
+    const old = await agreed(), next = await room(a,{ area: `Recovered search ${++sequence}` });
+    override = async () => plan('collect_details');
+    try { await send(old.conversation.id,'I agree'); } finally { override = undefined; }
+    const key = 'phase5-audit-search-recovery', details = { area: next.area };
+    await db.$executeRawUnsafe(`CREATE FUNCTION phase5_fail_search_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action='conversation.turn_completed' THEN RAISE EXCEPTION 'synthetic search audit failure'; END IF; RETURN NEW; END $$`);
+    await db.$executeRawUnsafe('CREATE TRIGGER phase5_fail_search_audit BEFORE INSERT ON "AuditLog" FOR EACH ROW EXECUTE FUNCTION phase5_fail_search_audit()');
+    override = async () => plan('search_properties');
+    try { assert.equal((await send(old.conversation.id,'Search again',details,a,key)).statusCode,500); }
+    finally {
+      override = undefined;
+      await db.$executeRawUnsafe('DROP TRIGGER phase5_fail_search_audit ON "AuditLog"');
+      await db.$executeRawUnsafe('DROP FUNCTION phase5_fail_search_audit()');
+    }
+    const pending = await db.conversationTurn.findFirstOrThrow({ where: { conversationId: old.conversation.id, status: 'PROCESSING' } });
+    await db.conversationTurn.update({ where: { id: pending.id }, data: { leaseUntil: new Date(Date.now()-1) } });
+    const calls = contexts.length;
+    override = async () => plan('create_booking_hold');
+    let recovered;
+    try { recovered = await send(old.conversation.id,'Search again',details,a,key); } finally { override = undefined; }
+    assert.equal(recovered.statusCode,200,recovered.body);
+    assert.equal(await db.booking.count({ where: { propertyId: { in: [old.property.id,next.id] } } }),0);
+    assert.equal(recovered.json().action,'search_properties'); assert.equal(contexts.length,calls);
+    assert.equal(recovered.json().conversation.inquiry.propertyId,next.id);
+    assert.equal((await db.conversation.findUniqueOrThrow({ where: { id: old.conversation.id } })).quoteOffer,null);
+    const fresh = await quote(old.conversation.id);
+    assert.equal((await send(old.conversation.id,'I agree',{},a,undefined,fresh.facts.quoteId)).json().facts.status,'HELD');
+    assert.equal(await db.booking.count({ where: { propertyId: old.property.id } }),0);
   });
 
   await t.test('database composite links reject another tenant and a payment for another booking in the same tenant', async () => {

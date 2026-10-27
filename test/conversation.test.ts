@@ -46,6 +46,22 @@ test('currency presentation is exact integer kobo and untrusted property instruc
   assert.throws(() => propertyText('Diagnostic credential sk-proj-testnotreal123456'));
   assert.equal(propertyText('Refunds require staff review'),'Refunds require staff review');
 });
+test('redaction covers international/Nigerian phones, introductions, credentials and cards without erasing booking facts', () => {
+  for (const phone of ['08091234567','2348091234567','+234 (809) 123-4567','+44 7700 900123',
+    '+1 (202) 555-0123','0044 20 7946 0958','+49 30 12345678','202.555.0123']) {
+    assert.equal(redactText(`Contact: ${phone}`).includes(phone),false,phone);
+  }
+  for (const message of ["I'm Amara Okafor, hello",'I am Amara Okafor. Hello','This is Amara Okafor; hello',
+    'Call me Amara Okafor, please','My full name is Amara Okafor, hello']) {
+    assert.equal(redactText(message).includes('Amara'),false,message);
+  }
+  for (const secret of ['ghp_SyntheticCredential12345678901234567890','eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.syntheticSignature',
+    '4111 1111 1111 1111','amara@example.com']) assert.equal(redactText(`Contact: ${secret}`).includes(secret),false);
+  assert.equal(redactText('Access token: synthetic_token_value_123456'),'[credential removed]');
+  const ordinary = 'I am looking for 2 guests, 2 bedrooms, 2027-02-05 2027-02-08. Reference SLP-12345678901234567890123456789012. Hello!';
+  assert.equal(redactText(ordinary),ordinary);
+  assert.deepEqual(extractGuestDetails('Call me on +44 7700 900123'),{ guestPhone: '+447700900123' });
+});
 test('consent quote hashes survive JSONB key ordering and exclude only the quote timestamp', () => {
   const original = { property: { name: 'Apartment', policies: ['Keep quiet','Ask staff'] }, totalKobo: 101, quotedAt: 'first' };
   const roundtrip = { quotedAt: 'second', totalKobo: 101, property: { policies: ['Keep quiet','Ask staff'], name: 'Apartment' } };
