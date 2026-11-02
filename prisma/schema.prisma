@@ -81,6 +81,12 @@ model Tenant {
   bankTransfer       BankTransferSetting?
   conversationTurns ConversationTurn[]
   escalations ConversationEscalation[]
+  usagePolicies UsagePolicy[]
+  usageEvents UsageEvent[]
+  usageWindows UsageWindow[]
+  usageInbound UsageInbound[]
+  usageAlerts UsageAlert[]
+  whatsappInbound WhatsAppInbound[]
 
   @@index([subscriptionStatus])
 }
@@ -326,7 +332,11 @@ model ChannelConnection {
   createdAt             DateTime  @default(now())
   updatedAt             DateTime  @updatedAt
 
-  @@unique([channel, externalBusinessId])
+  whatsappInbound WhatsAppInbound[]
+
+  @@index([channel, externalBusinessId])
+  @@unique([channel, externalPhoneNumberId])
+  @@unique([tenantId, id, externalPhoneNumberId])
   @@index([tenantId, channel, isActive])
 }
 
@@ -353,6 +363,7 @@ model Conversation {
   booking        Booking? @relation(fields: [tenantId, bookingId], references: [tenantId, id], onDelete: Restrict)
   paymentId      String?
   payment        Payment? @relation(fields: [tenantId, paymentId], references: [tenantId, id], onDelete: Restrict)
+  usageEvents    UsageEvent[]
   turns          ConversationTurn[]
   escalations    ConversationEscalation[]
 
@@ -376,6 +387,9 @@ model Message {
   turnId         String?
   turn           ConversationTurn? @relation(fields: [tenantId, conversationId, turnId], references: [tenantId, conversationId, id], onDelete: Cascade)
 
+  whatsappInbound WhatsAppInbound?
+
+  @@unique([tenantId, conversationId, id])
   @@unique([providerId])
   @@index([tenantId, conversationId, createdAt])
   @@unique([tenantId, turnId, direction])
@@ -397,6 +411,7 @@ model ConversationTurn {
   createdAt DateTime @default(now())
   completedAt DateTime?
   messages Message[]
+  usageEvents UsageEvent[]
   @@unique([tenantId, conversationId, id])
   @@unique([tenantId, conversationId, key])
   @@index([tenantId, conversationId, status])
@@ -453,4 +468,142 @@ model AuditLog {
 
   @@index([tenantId, createdAt])
   @@index([tenantId, entityType, entityId])
+}
+
+// USD amounts use integer millionths (micro-USD). SIMULATION is never a charge.
+model UsageGlobalPolicy {
+  mode String @id
+  monthlyCapMicroUsd BigInt
+  updatedAt DateTime @updatedAt
+}
+
+model UsagePolicy {
+  id String @id @default(cuid())
+  tenantId String
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  mode String
+  plan String
+  conversationAllowance Int
+  monthlyCapMicroUsd BigInt
+  minimumReservationMicroUsd BigInt
+  maxRequestMicroUsd BigInt
+  maxInputBytes Int
+  maxOutputTokens Int
+  maxCallsPerTurn Int
+  maxRetries Int
+  updatedAt DateTime @updatedAt
+  @@unique([tenantId, mode])
+}
+
+model UsageEvent {
+  id String @id @default(cuid())
+  tenantId String
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  mode String
+  eventType String @default("MODEL_CALL")
+  status String @default("RESERVED")
+  periodStart DateTime
+  periodEnd DateTime
+  conversationId String?
+  conversation Conversation? @relation(fields: [tenantId, conversationId], references: [tenantId, id], onDelete: Restrict)
+  turnId String?
+  turn ConversationTurn? @relation(fields: [tenantId, conversationId, turnId], references: [tenantId, conversationId, id], onDelete: Restrict)
+  key String
+  inputHash String
+  correlationId String @unique
+  provider String
+  model String
+  pricingVersion String
+  currency String @default("USD")
+  inputRateMicroUsd BigInt
+  outputRateMicroUsd BigInt
+  estimatedInputTokens Int
+  estimatedOutputTokens Int
+  reservedMicroUsd BigInt
+  accountedMicroUsd BigInt
+  actualInputTokens Int?
+  actualOutputTokens Int?
+  actualMicroUsd BigInt?
+  settlementHash String?
+  errorCategory String?
+  reservedAt DateTime @default(now())
+  reservationExpiresAt DateTime
+  dispatchedAt DateTime?
+  completedAt DateTime?
+  failedAt DateTime?
+  releasedAt DateTime?
+  reconciledAt DateTime?
+  @@unique([tenantId, mode, key])
+  @@index([mode, periodStart])
+  @@index([tenantId, mode, periodStart])
+  @@index([tenantId, conversationId, turnId])
+  @@index([status, reservationExpiresAt])
+}
+
+// Pseudonymous normalized identity; no guest text or raw phone in this ledger.
+model UsageWindow {
+  id String @id @default(cuid())
+  tenantId String
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  mode String
+  channel String @default("WHATSAPP")
+  identityHash String
+  periodStart DateTime
+  periodEnd DateTime
+  startedAt DateTime
+  lastInboundAt DateTime
+  expiresAt DateTime
+  receipts UsageInbound[]
+  @@unique([tenantId, mode, id])
+  @@index([tenantId, mode, identityHash, expiresAt])
+  @@index([tenantId, mode, periodStart])
+}
+
+model UsageInbound {
+  id String @id @default(cuid())
+  tenantId String
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  mode String
+  eventHash String
+  inputHash String
+  windowId String?
+  window UsageWindow? @relation(fields: [tenantId, mode, windowId], references: [tenantId, mode, id], onDelete: Restrict)
+  status String
+  receivedAt DateTime
+  @@unique([tenantId, mode, eventHash])
+}
+
+model UsageAlert {
+  id String @id @default(cuid())
+  tenantId String
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  mode String
+  periodStart DateTime
+  code String
+  threshold Int @default(0)
+  createdAt DateTime @default(now())
+  @@unique([tenantId, mode, periodStart, code, threshold])
+}
+
+// Phase 6B only ingests pilot/test numbers. Accounting is SIMULATION, never a charge.
+model WhatsAppInbound {
+  id String @id @default(cuid())
+  tenantId String
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  connectionId String
+  phoneNumberId String
+  connection ChannelConnection @relation(fields: [tenantId, connectionId, phoneNumberId], references: [tenantId, id, externalPhoneNumberId], onDelete: Restrict)
+  metaMessageId String
+  inputHash String
+  conversationId String
+  messageId String
+  message Message @relation(fields: [tenantId, conversationId, messageId], references: [tenantId, conversationId, id], onDelete: Restrict)
+  messageType String @default("text")
+  eventAt DateTime
+  receivedAt DateTime @default(now())
+  usageStatus String
+
+  @@unique([tenantId, phoneNumberId, metaMessageId])
+  @@unique([tenantId, conversationId, messageId])
+  @@index([tenantId, receivedAt])
 }

@@ -1,3 +1,5 @@
+import { UsageService, MockUsageFailure, usageInputHash } from './usage-service.js';
+import { localUsageRuntime, type UsageRuntime } from './usage-validation.js';
 import { createHash, randomBytes } from 'node:crypto';
 import { Prisma, type PrismaClient, type Conversation } from '@prisma/client';
 import type { AuthContext } from './authentication.js';
@@ -17,20 +19,20 @@ function tripValues(inquiry: ConversationWork['inquiry']) {
   return { propertyId: inquiry.propertyId, checkIn: inquiry.checkIn, checkOut: inquiry.checkOut, guestCount: inquiry.guestCount };
 }
 
-/** All inputs are simulated guest text submitted through authenticated staff context. */
+/** Mutations process staff simulations only. Read methods also expose tenant-owned inbound WhatsApp history. */
 export class ConversationService {
   private readonly tenantId: string;
   constructor(private readonly db: PrismaClient, private readonly auth: AuthContext, private readonly model: ConversationModel,
-    private readonly modelTimeoutMs = 5000, private readonly clock = () => new Date()) {
+    private readonly modelTimeoutMs = 5000, private readonly clock = () => new Date(), private readonly usageRuntime: UsageRuntime = localUsageRuntime()) {
     this.tenantId = auth.user.tenantId;
     if (!this.tenantId) throw new HttpError(401,'UNAUTHORIZED');
   }
   private permit(permission: Permission) {
     if (!hasPermission(this.auth.user.role, permission)) throw new HttpError(403,'FORBIDDEN');
   }
-  private async record(tx: Prisma.TransactionClient, id: string, lock = false) {
+  private async record(tx: Prisma.TransactionClient, id: string, lock = false, includeInbound = false) {
     if (lock) await tx.$queryRaw`SELECT id FROM "Conversation" WHERE id = ${id} AND "tenantId" = ${this.tenantId} AND simulation = true FOR UPDATE`;
-    const row = await tx.conversation.findFirst({ where: { id, tenantId: this.tenantId, simulation: true } });
+    const row = await tx.conversation.findFirst({ where: { id, tenantId: this.tenantId, ...(includeInbound ? { OR: [{simulation:true},{channel:'WHATSAPP' as const,externalId:{startsWith:'whatsapp:'}}] } : { simulation:true }) } });
     if (!row) throw new HttpError(404,'NOT_FOUND');
     return row;
   }
@@ -45,7 +47,7 @@ export class ConversationService {
   }
   private providerName() { return ['mock','openai','disabled'].includes(this.model.name) ? this.model.name : 'custom'; }
   private response(row: Conversation) {
-    return { id: row.id, simulated: true, modelProvider: this.providerName(), handlingMode: row.handlingMode,
+    return { id: row.id, simulated: row.simulation, channel: row.channel, modelProvider: row.simulation ? this.providerName() : 'disabled', handlingMode: row.handlingMode,
       needsAttention: row.needsAttention, inquiry: row.inquiry, bookingId: row.bookingId, paymentId: row.paymentId,
       hasGuestName: Boolean(row.guestName), hasGuestPhone: Boolean(row.guestPhone), lastMessageAt: row.lastMessageAt, createdAt: row.createdAt };
   }
@@ -70,19 +72,19 @@ export class ConversationService {
   }
   async get(id: string) {
     this.permit('inbox:read');
-    return this.response(await this.record(this.db,id));
+    return this.response(await this.record(this.db,id,false,true));
   }
   async list(input: unknown) {
     this.permit('inbox:read');
     const { limit, offset } = conversationListQuery.parse(input);
-    const rows = await this.db.conversation.findMany({ where: { tenantId: this.tenantId, simulation: true }, take: limit, skip: offset,
+    const rows = await this.db.conversation.findMany({ where: { tenantId: this.tenantId, OR: [{simulation:true},{channel:'WHATSAPP',externalId:{startsWith:'whatsapp:'}}] }, take: limit, skip: offset,
       orderBy: [{ updatedAt: 'desc' },{ id: 'desc' }] });
     return { conversations: rows.map((row) => this.response(row)), limit, offset };
   }
   async history(id: string, input: unknown) {
     this.permit('inbox:read');
     const { limit, before } = historyQuery.parse(input);
-    await this.record(this.db,id);
+    await this.record(this.db,id,false,true);
     const cursor = before ? await this.db.message.findFirst({ where: { id: before, tenantId: this.tenantId, conversationId: id } }) : null;
     if (before && !cursor) throw new HttpError(404,'NOT_FOUND');
     const rows = await this.db.message.findMany({ where: { tenantId: this.tenantId, conversationId: id,
@@ -94,7 +96,7 @@ export class ConversationService {
   }
   async escalations(id: string) {
     this.permit('inbox:read');
-    await this.record(this.db,id);
+    await this.record(this.db,id,false,true);
     return this.db.conversationEscalation.findMany({ where: { tenantId: this.tenantId, conversationId: id },
       select: { id: true, reason: true, context: true, status: true, createdAt: true, resolvedAt: true }, orderBy: { createdAt: 'desc' }, take: 100 });
   }
@@ -188,7 +190,7 @@ export class ConversationService {
         const context: ModelContext = { message, inquiry, hasHold: Boolean(work.bookingId), hasQuote: Boolean(work.quoteOffer),
           hasConsent: Boolean(work.quoteOffer?.accepted), hasName: Boolean(work.guestName), hasPhone: Boolean(work.guestPhone), today: lagosDate(this.clock()) };
         const savedPlan = (turn.request as { plan?: unknown }).plan;
-        const output = savedPlan ?? await this.modelPlan(context);
+        const output = savedPlan ?? await this.modelPlan(context,id,turn.id,turn.leaseToken);
         const parsed = modelPlanSchema.safeParse(output);
         if (!parsed.success) throw new HttpError(409,'MODEL_INVALID_OUTPUT');
         const modelPlan = parsed.data;
@@ -297,13 +299,42 @@ export class ConversationService {
     }
     if (hash(tripValues(work.inquiry)) !== previous) work.quoteOffer = null;
   }
-  private async modelPlan(context: ModelContext) {
+  private async modelPlan(context: ModelContext, conversationId: string, turnId: string, leaseToken: string) {
+    // Phase 6A explicitly permits only a mock. The optional real adapter remains unreachable here.
+    if (this.model.name !== 'mock') throw new HttpError(503,'MODEL_UNAVAILABLE');
+    const usage = new UsageService(this.db,this.auth,this.usageRuntime,this.clock);
+    const guard = async (tx: Prisma.TransactionClient) => {
+      const row = await this.record(tx,conversationId,true);
+      const turn = await tx.conversationTurn.findFirst({ where: { id: turnId, tenantId: this.tenantId, conversationId,
+        status: 'PROCESSING', leaseToken, leaseUntil: { gt: this.clock() } } });
+      if (!turn) throw new HttpError(409,'TURN_LEASE_LOST');
+      if (row.handlingMode !== 'AI') throw new HttpError(409,'CONVERSATION_TAKEN_OVER');
+    };
+    const reserved = await usage.reserve({ key: `${turnId}:${hash(leaseToken)}`, inputHash: usageInputHash(context),
+      estimatedInputTokens: Buffer.byteLength(JSON.stringify(context),'utf8'), conversationId, turnId },'SIMULATION',guard);
+    if (reserved.replay) throw new HttpError(409,'USAGE_RECOVERY_REQUIRED');
+    const fixture = this.model.usageFixture;
+    if (fixture && (![fixture.inputTokens,fixture.outputTokens].every((v) => Number.isSafeInteger(v) && v >= 0) ||
+        fixture.inputTokens > reserved.event.estimatedInputTokens || fixture.outputTokens > reserved.event.estimatedOutputTokens)) {
+      await usage.settle(reserved.event.id,{ kind: 'release' });
+      throw new HttpError(409,'MODEL_INVALID_OUTPUT');
+    }
+    await usage.dispatch(reserved.event.id,guard);
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let output: unknown;
     try {
-      return await Promise.race([this.model.plan(context,controller.signal),new Promise<never>((_resolve,reject) => {
+      output = await Promise.race([this.model.plan(context,controller.signal),new Promise<never>((_resolve,reject) => {
         timer = setTimeout(() => { controller.abort(); reject(new HttpError(503,'MODEL_UNAVAILABLE')); },this.modelTimeoutMs);
       })]);
+    } catch (error) {
+      await usage.settle(reserved.event.id,{ kind: error instanceof MockUsageFailure && error.knownZero ? 'known_failure' : 'unknown' });
+      throw error;
     } finally { if (timer) clearTimeout(timer); controller.abort(); }
+    await usage.settle(reserved.event.id,fixture ? { kind: 'complete',
+      inputTokens: fixture.inputTokens, outputTokens: fixture.outputTokens } : { kind: 'unknown' });
+    // A model cannot return an unbounded output even in simulation. Tokens are conservative UTF-8 byte bounds.
+    if (Buffer.byteLength(JSON.stringify(output) ?? '', 'utf8') > reserved.event.estimatedOutputTokens) throw new HttpError(409,'MODEL_INVALID_OUTPUT');
+    return output;
   }
 }

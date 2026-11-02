@@ -1,3 +1,4 @@
+import { whatsappWebhookRoutes } from './routes/whatsapp-webhook.js';
 import Fastify from 'fastify';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
@@ -18,6 +19,8 @@ export async function buildApp(config: AppConfig, options: { db?: PrismaClient; 
   const app = Fastify({
     logger: options.logger === false ? false : {
       level: config.NODE_ENV === 'production' ? 'info' : 'debug',
+      // Verification credentials arrive in the query string. Never serialize it into request logs.
+      serializers: { req: (req) => ({ method: req.method, url: req.url?.split('?')[0], hostname: req.hostname, remoteAddress: req.ip }) },
       redact: ['req.headers.authorization', 'req.headers.cookie', 'res.headers["set-cookie"]']
     },
     bodyLimit: 16_384,
@@ -74,7 +77,10 @@ export async function buildApp(config: AppConfig, options: { db?: PrismaClient; 
     config.AI_PROVIDER === 'mock' ? new MockConversationModel() : { name: 'disabled', async plan() { throw new Error('MODEL_UNAVAILABLE'); } });
   await app.register(healthRoutes, { prefix: '/api', db });
   await app.register(authRoutes, { prefix: '/api/auth', authentication, authRateLimitMax: config.AUTH_RATE_LIMIT_MAX });
-  await app.register(operatorRoutes, { prefix: '/api', db, authentication, paymentProvider, conversationModel, modelTimeoutMs: config.AI_TIMEOUT_MS });
+  await app.register(operatorRoutes, { prefix: '/api', db, authentication, paymentProvider, conversationModel, modelTimeoutMs: config.AI_TIMEOUT_MS, usageRuntime: { developmentDefaults: config.NODE_ENV !== 'production',
+    productionGlobalCapMicroUsd: config.USAGE_PRODUCTION_GLOBAL_CAP_MICRO_USD === undefined ? undefined : BigInt(config.USAGE_PRODUCTION_GLOBAL_CAP_MICRO_USD),
+    simulationGlobalCapMicroUsd: config.USAGE_SIMULATION_GLOBAL_CAP_MICRO_USD === undefined ? undefined : BigInt(config.USAGE_SIMULATION_GLOBAL_CAP_MICRO_USD) } });
   await app.register(paymentWebhookRoutes, { prefix: '/api/webhooks', db, paymentProvider, secret: config.PAYSTACK_TEST_SECRET_KEY });
+  await app.register(whatsappWebhookRoutes, { prefix: '/api/webhooks', db, enabled: config.META_WEBHOOK_ENABLED, secret: config.META_APP_SECRET, verifyToken: config.META_VERIFY_TOKEN });
   return app;
 }

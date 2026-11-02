@@ -1,3 +1,5 @@
+import { whatsappConnectionRoutes } from './whatsapp-connections.js';
+import { WhatsAppConnections } from '../services/whatsapp-connections.js';
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import type { PrismaClient } from '@prisma/client';
 import { hasPermission, type Permission } from '../services/authorization.js';
@@ -11,6 +13,9 @@ import { BookingService } from '../services/booking-service.js';
 import { PaymentService } from '../services/payment-service.js';
 import type { PaymentProvider } from '../services/payment-provider.js';
 import { paymentRoutes } from './payments.js';
+import { usageRoutes } from './usage.js';
+import { UsageService } from '../services/usage-service.js';
+import type { UsageRuntime } from '../services/usage-validation.js';
 import { conversationRoutes } from './conversations.js';
 import { ConversationService } from '../services/conversation-service.js';
 import type { ConversationModel } from '../services/conversation-model.js';
@@ -20,7 +25,7 @@ declare module 'fastify' {
 }
 
 export const operatorRoutes: FastifyPluginAsync<{ db: PrismaClient; authentication: AuthenticationService; paymentProvider?: PaymentProvider;
-  conversationModel: ConversationModel; modelTimeoutMs: number }> = async (app, options) => {
+  conversationModel: ConversationModel; modelTimeoutMs: number; usageRuntime: UsageRuntime }> = async (app, options) => {
   app.decorateRequest('auth', null);
   app.addHook('onRequest', async (request) => {
     request.auth = await options.authentication.authenticate(request.headers.authorization);
@@ -34,10 +39,13 @@ export const operatorRoutes: FastifyPluginAsync<{ db: PrismaClient; authenticati
   };
   const repository = (request: FastifyRequest) => new TenantRepository(options.db, requireAuth(request));
 
+  await app.register(whatsappConnectionRoutes, { service: r => new WhatsAppConnections(options.db, requireAuth(r)), permit });
   await app.register(propertyRoutes, { repository, permit });
   await app.register(bookingRoutes, { service: (request) => new BookingService(options.db, requireAuth(request)), permit });
   await app.register(paymentRoutes, { service: (request) => new PaymentService(options.db, options.paymentProvider, requireAuth(request)), permit });
-  await app.register(conversationRoutes, { service: (request) => new ConversationService(options.db,requireAuth(request),options.conversationModel,options.modelTimeoutMs), permit });
+  await app.register(conversationRoutes, { service: (request) => new ConversationService(options.db,requireAuth(request),options.conversationModel,options.modelTimeoutMs,undefined,options.usageRuntime), permit });
+
+  await app.register(usageRoutes, { service: (request) => new UsageService(options.db,requireAuth(request),options.usageRuntime), permit });
 
   app.get('/auth/me', async (request) => {
     emptyQuery.parse(request.query);

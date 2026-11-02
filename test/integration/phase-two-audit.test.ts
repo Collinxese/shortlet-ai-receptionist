@@ -131,8 +131,11 @@ test('Phase 2 security audit regressions', async (t) => {
     const constraints = await db.$queryRaw<{ name: string; tableName: string; definition: string }[]>`
       SELECT conname AS name, conrelid::regclass::text AS "tableName", pg_get_constraintdef(oid) AS definition
       FROM pg_constraint WHERE contype = 'x' AND connamespace = current_schema()::regnamespace`;
-    assert.deepEqual(constraints.map((item) => item.name).sort(), ['AvailabilityBlock_no_overlap', 'Booking_durable_no_overlap', 'PriceRule_dates_no_overlap']);
-    assert.ok(constraints.every((item) => item.definition.includes('[)') && item.definition.includes('"tenantId"') && item.definition.includes('"propertyId"')));
+    assert.deepEqual(constraints.map((item) => item.name).sort(), ['AvailabilityBlock_no_overlap', 'Booking_durable_no_overlap', 'PriceRule_dates_no_overlap', 'UsageWindow_no_overlap']);
+    const propertyConstraints = constraints.filter((item) => item.name !== 'UsageWindow_no_overlap');
+    assert.ok(propertyConstraints.every((item) => item.definition.includes('[)') && item.definition.includes('"tenantId"') && item.definition.includes('"propertyId"')));
+    const windowConstraint = constraints.find((item) => item.name === 'UsageWindow_no_overlap')!;
+    assert.ok(windowConstraint.definition.includes('[)') && windowConstraint.definition.includes('"tenantId"') && windowConstraint.definition.includes('"identityHash"') && windowConstraint.definition.includes('mode'));
     const calendar = await request('GET', `/properties/${property.id}/availability?checkIn=2027-01-10&checkOut=2027-01-12`);
     assert.equal(calendar.json().available, false);
   });

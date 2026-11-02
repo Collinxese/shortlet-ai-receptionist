@@ -39,6 +39,10 @@ test('Phase 2 migration preserves populated Phase 1 data and readiness detects a
     cli('db', 'execute', '--schema', 'prisma/schema.prisma', '--file', 'prisma/migrations/20261025000300_payment_foundation/migration.sql');
     assert.equal((await app.inject('/api/ready')).statusCode, 503);
     cli('db', 'execute', '--schema', 'prisma/schema.prisma', '--file', 'prisma/migrations/20261026000100_conversation_engine/migration.sql');
+    assert.equal((await app.inject('/api/ready')).statusCode, 503);
+    cli('db', 'execute', '--schema', 'prisma/schema.prisma', '--file', 'prisma/migrations/20261028000100_usage_ledger/migration.sql');
+    assert.equal((await app.inject('/api/ready')).statusCode, 503);
+    cli('db', 'execute', '--schema', 'prisma/schema.prisma', '--file', 'prisma/migrations/20261102000100_whatsapp_inbound/migration.sql');
     assert.equal((await app.inject('/api/ready')).statusCode, 200);
   } finally { await app.close(); }
   const property = await db.property.findUniqueOrThrow({ where: { id: 'property-a' }, include: { otherFees: true } });

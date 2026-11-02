@@ -22,20 +22,23 @@ export type Permission =
   | 'team:read'
   | 'team:write'
   | 'settings:write'
-  | 'audit:read';
+  | 'audit:read'
+  | 'usage:read'
+  | 'usage:write'
+  | 'whatsapp:manage';
 
 const permissions: Record<UserRole, ReadonlySet<Permission>> = {
   OWNER: new Set<Permission>([
     'dashboard:read', 'inbox:read', 'inbox:reply', 'inbox:takeover',
     'leads:read', 'leads:update', 'bookings:read', 'bookings:create', 'bookings:cancel',
     'properties:read', 'properties:write', 'pricing:write', 'availability:write',
-    'payments:read', 'payments:create', 'payments:verify', 'payment-settings:write', 'refunds:approve', 'team:read', 'team:write', 'settings:write', 'audit:read'
+    'payments:read', 'payments:create', 'payments:verify', 'payment-settings:write', 'refunds:approve', 'team:read', 'team:write', 'settings:write', 'audit:read', 'usage:read', 'usage:write', 'whatsapp:manage'
   ]),
   MANAGER: new Set<Permission>([
     'dashboard:read', 'inbox:read', 'inbox:reply', 'inbox:takeover',
     'leads:read', 'leads:update', 'bookings:read', 'bookings:create', 'bookings:cancel',
     'properties:read', 'properties:write', 'pricing:write', 'availability:write',
-    'payments:read', 'payments:create', 'payments:verify', 'payment-settings:write', 'team:read', 'audit:read'
+    'payments:read', 'payments:create', 'payments:verify', 'payment-settings:write', 'team:read', 'audit:read', 'usage:read', 'usage:write', 'whatsapp:manage'
   ]),
   RECEPTIONIST: new Set<Permission>([
     'dashboard:read', 'inbox:read', 'inbox:reply', 'inbox:takeover',

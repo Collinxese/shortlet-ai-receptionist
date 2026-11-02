@@ -7,13 +7,20 @@ const environment = z.object({
   HOST: z.string().min(1).default('127.0.0.1'),
   SESSION_TTL_HOURS: z.coerce.number().int().min(1).max(24).default(8),
   AUTH_RATE_LIMIT_MAX: z.coerce.number().int().min(1).max(30).default(10),
+  META_WEBHOOK_ENABLED: z.enum(['true','false']).default('false').transform(value => value === 'true'),
+  META_APP_SECRET: z.preprocess(v => v === '' ? undefined : v, z.string().regex(/^[A-Za-z0-9_-]{16,512}$/).optional()),
+  META_VERIFY_TOKEN: z.preprocess(v => v === '' ? undefined : v, z.string().regex(/^[A-Za-z0-9_-]{32,512}$/).optional()),
   AI_PROVIDER: z.enum(['mock','openai','disabled']).default('mock'),
   AI_MODEL: z.preprocess((value) => value === '' ? undefined : value, z.string().regex(/^[A-Za-z0-9._:-]{1,120}$/).optional()),
   OPENAI_API_KEY: z.preprocess((value) => value === '' ? undefined : value, z.string().regex(/^\S{10,512}$/).optional()),
+  USAGE_PRODUCTION_GLOBAL_CAP_MICRO_USD: z.preprocess((v) => v === '' ? undefined : v, z.string().regex(/^(0|[1-9]\d{0,14})$/).optional()),
+  USAGE_SIMULATION_GLOBAL_CAP_MICRO_USD: z.preprocess((v) => v === '' ? undefined : v, z.string().regex(/^(0|[1-9]\d{0,14})$/).optional()),
   AI_TIMEOUT_MS: z.coerce.number().int().min(50).max(15000).default(5000),
   PAYSTACK_TEST_ENABLED: z.enum(['true', 'false']).default('false').transform((value) => value === 'true'),
   PAYSTACK_TEST_SECRET_KEY: z.preprocess((value) => value === '' ? undefined : value,
     z.string().regex(/^sk_test_[A-Za-z0-9]+$/).optional())
+}).refine(value => !value.META_WEBHOOK_ENABLED || Boolean(value.META_APP_SECRET && value.META_VERIFY_TOKEN && value.AI_PROVIDER === 'mock' && !value.PAYSTACK_TEST_ENABLED), {
+  path: ['META_WEBHOOK_ENABLED']
 }).refine((value) => value.AI_PROVIDER !== 'openai' || Boolean(value.OPENAI_API_KEY && value.AI_MODEL), {
   path: ['AI_PROVIDER']
 }).refine((value) => !value.PAYSTACK_TEST_ENABLED || Boolean(value.PAYSTACK_TEST_SECRET_KEY), {

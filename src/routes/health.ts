@@ -18,6 +18,13 @@ export const healthRoutes: FastifyPluginAsync<{ db: PrismaClient }> = async (app
       await db.$queryRaw`SELECT simulation, inquiry, "bookingId" FROM "Conversation" LIMIT 0`;
       await db.$queryRaw`SELECT 1 FROM "ConversationTurn" LIMIT 0`;
       await db.$queryRaw`SELECT 1 FROM "ConversationEscalation" LIMIT 0`;
+      await db.$queryRaw`SELECT 1 FROM "UsageEvent" LIMIT 0`;
+      await db.$queryRaw`SELECT 1 FROM "UsagePolicy" LIMIT 0`;
+      await db.$queryRaw`SELECT 1 FROM "UsageGlobalPolicy" LIMIT 0`;
+      await db.$queryRaw`SELECT 1 FROM "UsageWindow" LIMIT 0`;
+      await db.$queryRaw`SELECT 1 FROM "UsageInbound" LIMIT 0`;
+      await db.$queryRaw`SELECT 1 FROM "UsageAlert" LIMIT 0`;
+      await db.$queryRaw`SELECT 1 FROM "WhatsAppInbound" LIMIT 0`;
       return { ready: true, dependencies: { database: 'connected' } };
     } catch {
       return reply.code(503).send({ ready: false, dependencies: { database: 'unavailable' } });

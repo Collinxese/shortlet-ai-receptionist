@@ -25,7 +25,7 @@ All routes are under `/api`. Send JSON bodies with `Content-Type: application/js
 | Method / path | Access | Purpose |
 | --- | --- | --- |
 | `GET /health` | Public | Application liveness; independent of the database |
-| `GET /ready` | Public | `200` when PostgreSQL and required Phase 1–5 schema are reachable; otherwise `503` |
+| `GET /ready` | Public | `200` when PostgreSQL and required Phase 1–6B schema are reachable; otherwise `503` |
 | `POST /auth/register` | Public, rate limited | Create a tenant and its OWNER atomically |
 | `POST /auth/login` | Public, rate limited | Authenticate an active operator |
 | `GET /auth/me` | Any authenticated role | Current operator and tenant ID |
@@ -44,7 +44,7 @@ Login uses `{ "email": "operator@example.com", "password": "a-long-unique-passwo
 
 Registration and login return `accessToken`, `tokenType`, `expiresAt`, and safe `user` fields. Send the token as `Authorization: Bearer <accessToken>` on protected requests. Tokens contain 256 random bits; PostgreSQL stores only their SHA-256 digests. `SESSION_TTL_HOURS` controls absolute expiry (default eight hours, maximum 24). Logout deletes the current session. Every request checks expiration, current role, and account activity against PostgreSQL. Deactivation also deletes all the user's sessions; reactivation requires a new login. There is no token in a URL or cookie and no refresh-token endpoint. A future browser client should keep bearer tokens in memory and use HTTPS.
 
-Permissions use the server-side role matrix. Client role/tenant IDs never grant access. The tenant repository and booking service filter business queries by the tenant from the authenticated session. Foreign resource IDs return the same `404` as missing IDs. Composite foreign keys also prevent a child row from referring to a parent in a different tenant. Business routes must use these scoped services. Only OWNER and MANAGER can change properties, pricing or operator blocks. All three roles can handle routine booking requests, holds, extensions and eligible cancellations. Authenticated conversation simulations are implemented in Phase 5; external guest messaging remains future work.
+Permissions use the server-side role matrix. Client role/tenant IDs never grant access. The tenant repository and booking service filter business queries by the tenant from the authenticated session. Foreign resource IDs return the same `404` as missing IDs. Composite foreign keys also prevent a child row from referring to a parent in a different tenant. Business routes must use these scoped services. Only OWNER and MANAGER can change properties, pricing or operator blocks. All three roles can handle routine booking requests, holds, extensions and eligible cancellations. Authenticated conversation simulations are implemented in Phase 5; Phase 6B adds inbound-only WhatsApp pilot recording. Guest replies remain future work.
 
 Registration/login share `AUTH_RATE_LIMIT_MAX` requests per IP per minute, including invalid attempts. The general API limit is 120 requests per IP per minute. Health probes are excluded. Proxy forwarding headers are not trusted; deployment behind a proxy needs an explicitly configured trusted proxy list. Limits are currently in process memory and require a shared store before running several API instances.
 
@@ -500,3 +500,200 @@ This phase is a local development foundation. Before production: configure HTTPS
 See `docs/BUILD_PLAN.md` for remaining phases. Requests, quotes, holds, controlled verification/confirmation, manual transfers, Paystack test-mode code and authenticated conversation simulations with a mock/optional planning adapter are implemented locally. Paid sandbox checkout, external webhook delivery, live model operation, live charging/settlement, refunds, paid cancellation, automated reconciliation, WhatsApp, frontend and deployment remain unverified or unimplemented as described above. Operational security work listed above still applies.
 
 Dependency audit: the resolved Prisma 6 tooling chain currently reports three high-severity findings associated with [GHSA-ggr8-5vv4-36mx](https://github.com/advisories/GHSA-ggr8-5vv4-36mx) in `deepmerge-ts` (also flagged through `@prisma/config` and `prisma`). The advisory requires recursive JavaScript objects; plain JSON alone cannot trigger that condition. This API does not pass requests into Prisma's configuration merger. A supported fix for this dependency chain requires a reviewed Prisma major upgrade; `npm audit fix --force` was not applied. Reassess this before production and after dependency updates.
+
+## Phase 6A — tenant usage and AI cost ledger
+
+Phase 6A keeps the planner mock-only. `AI_PROVIDER=mock` remains the default; selecting the retained optional `openai` adapter cannot invoke it through conversations in this phase. No WhatsApp transport, guest ingress route, subscription charge, paid overage, or live AI acceptance is implemented. Booking/payment authority and Phase 5 lease, takeover, consent and saved-plan recovery remain in their existing services.
+
+The additive `20261028000100_usage_ledger` migration creates `UsagePolicy`, `UsageGlobalPolicy`, `UsageEvent`, `UsageWindow`, `UsageInbound`, and `UsageAlert`. Apply it through the normal reviewed `npm run db:deploy` workflow and regenerate the client with `npm run db:generate`. The implementation and all migration experiments use disposable PostgreSQL only. Liveness is independent of the database; readiness now checks all six usage tables as well as the previous schema.
+
+### Accounting and concurrency
+
+Costs are integer **micro-USD** (one USD = 1,000,000 units), represented by PostgreSQL BIGINT/JavaScript bigint and decimal strings over JSON. No floating currency arithmetic or conversion to booking/payment NGN amounts occurs. Every event snapshots the provider/model, pricing version, per-token rates, token upper bounds, maximum reserved amount, billing month, correlation ID, idempotency digest and lifecycle timestamps. The ledger stores no raw messages, prompt bodies, phone numbers, keys or payment secrets.
+
+Simulation pricing `UNVERIFIED-TEST-USD-v1` uses **fictional** rates of 2 micro-USD per input token and 5 per output token. This table is versioned test data, not an actual provider rate or charge. Multiplication uses integers with no rounding. Fixture counts must fit reserved bounds; excess counts cannot silently release budget. The full serialized minimized context is bounded using UTF-8 byte length as a conservative input-token bound. Output has a configured limit and the mock's returned plan is also size-checked. Real provider tokenization, verified pricing, output limits and external acceptance remain gated future work.
+
+Accounting/configuration writes acquire one transaction-scoped PostgreSQL advisory lock per mode, then any required conversation lock, in READ COMMITTED transactions. This deliberately serializes short budget transactions across instances. The model executes **outside** the lock. Each reservation sums `accountedMicroUsd` for the tenant and globally in the current period, checks both caps, then writes the reservation and audit atomically. Pending and unknown calls count at the full reserved maximum; completed calls count at reconciled fixture cost. Cap reductions affect subsequent reservations and never erase existing commitments. The global policy is never exposed through tenant APIs.
+
+`UsageEvent` has a tenant/mode/key uniqueness constraint, tenant/conversation/turn composite foreign keys, amount/state checks and an immutable-terms/terminal-state trigger. The same normalized reservation input replays its record; changed input conflicts. Dispatch is a separate audited one-time transition; expired reservations and prior-month reservations cannot dispatch. Completed conversation turns and stored Phase 5 plans replay without another model call. A recovered turn without a saved plan may use another separately reserved attempt only within both the call and retry limits; previous uncertain attempts remain fully accounted. Zero retries means at most one attempt.
+
+A known zero-usage mock failure releases the reservation. A timeout, unreported usage, failed settlement, or abandoned dispatched call retains its full amount (`RESERVED` or `REVIEW`). Recovery releases only provably undispatched expired work. Late trusted fixture results can reconcile a review once; conflicting terminal results are rejected. Ledger/audit failure before dispatch prevents the call; failure after dispatch cannot undo possible consumption and does not permit unrecorded tool execution. A database outage may return a safe 500 when even fallback persistence is unavailable. Never interpret missing ledger completion as zero spend.
+
+The global advisory lock, cap summation, authorization, honest outcome classification and audit insertion are application transaction invariants. SQL constraints independently protect links, unique accounting identities, monetary/state consistency, immutable snapshots and terminal events. Privileged raw SQL is not a supported accounting API and can bypass cap/allowance policy; production access must preserve this service boundary. The global lock is intentionally conservative and requires contention/load testing before scaling.
+
+### Provisional conversation allowance
+
+Calendar billing periods are half-open months in **Africa/Lagos**, including the UTC+01:00 month boundary. There is no finalized subscription pricing. STARTER/GROWTH/PRO supply provisional allowances of **300/1,000/3,000**; OWNER/MANAGER can explicitly set another allowance with an audited policy change.
+
+`UsageService.recordInbound` is a trusted server-only accounting boundary, not a webhook integration. Its production path requires an existing tenant-owned, non-simulated WHATSAPP conversation whose normalized phone matches. No public production ingress route calls it yet. Windows use a tenant/channel/normalized-phone digest and a rolling 24-hour inactivity deadline. A new eligible inbound event starts a window only when the allowance permits; each subsequent eligible inbound extends the window. Exactly-at-expiry starts a new window. Concurrent starts serialize, and a PostgreSQL exclusion constraint prevents overlapping windows for the same identity.
+
+Duplicate delivery IDs replay the original receipt without counting or extending inactivity, even after renewal. Denied receipts also remain denied on replay; a subsequent new eligible message can start after renewal/authorized plan change. Staff/AI replies, property changes, multiple booking opportunities and takeover do not call this accounting boundary. The same guest in another tenant is a distinct identity. An existing window may continue when the new-conversation allowance is exhausted or reduced, subject to financial/request limits. Allowance belongs to the window's start month; AI usage belongs to the dispatch month. Runtime clocks must be synchronized; timestamp injection exists for deterministic tests.
+
+Ordinary `/simulations/conversations` messages **never create production billable windows**. They still reserve and account simulated AI usage. The dedicated inbound fixture endpoint exercises counting in the separate SIMULATION namespace; it does not deliver a WhatsApp message. Production AI calls remain disabled even if caps are configured.
+
+### Configuration and staff API
+
+All paths are under `/api`; authentication derives the tenant. All usage inspection and financial configuration routes require OWNER or MANAGER, checked again by the service. Guests, receptionists and model tools cannot change budgets. Unknown fields, including client tenant IDs, are rejected.
+
+| Method/path | Purpose |
+| --- | --- |
+| `GET /usage?mode=SIMULATION` | Current tenant/month policy, accounted micro-USD and conversation count |
+| `GET /usage/events?mode=SIMULATION&limit=50` | Current tenant's ledger, at most 100 records |
+| `GET /usage/events/:eventId` | Tenant-scoped event; foreign/missing IDs both return 404 |
+| `GET /usage/alerts?mode=SIMULATION&limit=50` | Durable staff-visible warnings/review/blocking events |
+| `PUT /usage/policy/:mode` | Audited tenant financial/request configuration; SIMULATION or PRODUCTION |
+| `POST /usage/simulations` | Deterministic completion/failure/unknown usage fixture; requires Idempotency-Key |
+| `POST /usage/simulations/inbound` | SIMULATION-only eligible-inbound counting fixture |
+| `POST /usage/simulations/:eventId/reconcile` | Reconcile a simulated uncertain event using fixture counts |
+| `POST /usage/recover` | Recover at most 100 expired reservations per mode for this tenant |
+
+Example policy body (all monetary figures below are **non-production test fixtures**, not recommendations):
+
+```json
+{"plan":"STARTER","conversationAllowance":300,"monthlyCapMicroUsd":"10000000","minimumReservationMicroUsd":"1000","maxRequestMicroUsd":"100000","maxInputBytes":16384,"maxOutputTokens":1500,"maxCallsPerTurn":2,"maxRetries":1}
+```
+
+`conversationAllowance` may be omitted to use the provisional plan allowance. Configuration bounds reject negative/fractional monetary values, unsafe integer ranges, inconsistent reservation limits and retry counts at or above the call count. A zero monthly cap or zero allowance intentionally blocks the corresponding new work. Warnings at 70%, 85% and 100%, cap denials and unknown outcomes create deduplicated `UsageAlert` plus audit entries. Staff must poll these endpoints; no email, WhatsApp or other automatic notification is sent. Cap/allowance fallback cannot confirm a booking or verify payment.
+
+Outside production only, missing SIMULATION policy is initialized to the example policy; its global fixture cap is 100000000 micro-USD, optionally set with `USAGE_SIMULATION_GLOBAL_CAP_MICRO_USD`. Production does not initialize these development defaults. `USAGE_PRODUCTION_GLOBAL_CAP_MICRO_USD` has no default and can provision an initially absent production global policy. Existing global policy rows are authoritative and never overwritten by instance startup/environment changes; later platform-level global changes require an explicit reviewed database operation using the same accounting lock. No tenant route can set a global cap. Missing production policy fails closed, and no production provider pricing is invented.
+
+Usage fixture body: `{"inputTokens":100,"outputTokens":50,"outcome":"complete"}`; outcomes also include `known_failure` and `unknown`. Optional `conversationId` must belong to the authenticated tenant. Inbound fixture body: `{"phone":"+2348090000000","eventId":"synthetic-inbound-001"}`. Reconciliation body: `{"inputTokens":100,"outputTokens":50}`. Use synthetic contacts and disposable data. The phone is normalized and hashed before storing a counting identity; hashes are pseudonymous, not a guarantee of anonymization.
+
+The previously reviewed `deepmerge-ts` **8.0.2** override and lockfile are preserved. No new dependency is required for Phase 6A. Operational follow-ups include retention, monitoring, scheduled reservation recovery, real-provider pricing/acceptance, distributed ingress authentication and load testing. No real AI, WhatsApp, live payment, frontend or deployment was added.
+
+### Phase 6A verification — 2026-10-28
+
+Final verification used Node 22.20.0, Prisma/client 6.19.3 and a newly initialized loopback-only PostgreSQL 15.19 cluster. The final build passed; **43 unit tests and 161 integration tests passed with zero failures/skips**. All original Phase 1–5 assertions remain. A further final targeted conversation/usage run passed 46 tests. No new dependencies were installed, and both npm audits report zero vulnerabilities with the existing deepmerge-ts 8.0.2 override.
+
+All test commands ran with `AI_PROVIDER=mock` and `PAYSTACK_TEST_ENABLED=false`. `DATABASE_URL`, `TEST_DATABASE_URL` and the probe's `SHADOW_DATABASE_URL` were explicitly set to newly created disposable databases; `.env` values were not used as database targets. Exact argument lists/exit codes and persistent logs are retained at `/Users/apple/.codex/audit-artifacts/shortlet-phase6a-3npy53xk/commands.jsonl` and adjacent log files.
+
+| Command | Actual final result |
+| --- | --- |
+| `npm run build` | Exit 0 |
+| `npm test` | Exit 0; 43 passed |
+| `npm run test:integration` | Exit 0; 161 passed |
+| `npx tsx --test --test-concurrency=1 test/integration/phase-five.test.ts test/integration/phase-six-a.test.ts` | Exit 0; 46 passed |
+| `npx prisma validate` | Exit 0 |
+| `npx prisma generate` | Exit 0; client 6.19.3 |
+| `npx prisma migrate deploy` | Exit 0; all eight migrations applied to a fresh disposable database |
+| `npx prisma migrate status` | Exit 0; up to date |
+| `npx prisma migrate diff --from-url "$DISPOSABLE_DATABASE_URL" --to-schema-datamodel prisma/schema.prisma --exit-code` | Exit 0; no difference |
+| `npx prisma migrate deploy --schema "$PROBE_SCHEMA"` | Exit 0; temporary schema/history copy, separate disposable probe database |
+| `npx prisma migrate dev --schema "$PROBE_SCHEMA" --name usage_ledger_probe --skip-generate` | Exit 0; only a nullable temporary probe column added |
+| `npx prisma migrate status --schema "$PROBE_SCHEMA"` | Exit 0 |
+| `npm audit --json` and `npm audit --omit=dev --json` | Both exit 0; zero vulnerabilities |
+| `git diff --check` | Exit 0 |
+
+The actual development-migration probe preserved all **197 functions** (nine application functions), function ownership/security/search-path settings, **90 constraints, seven enabled triggers and 97 indexes**. All eight pre-probe migration-history records remained identical; only the temporary probe migration was appended. The usage migration's populated-upgrade/failure/resolve/retry test separately preserves historical records and all previous function/constraint/trigger/index definitions. The seven historical migration files, existing dependency changes, booking/payment services, conversation tools and `.env` match their baseline hashes.
+
+Development failures are retained in the logs: initial TypeScript type errors were corrected; an accidentally repeated new exclusion definition caused transactional migration rejection and was fixed before successful replay. The first full integration run had 158 passes and three reported failures (two underlying fixture assumptions plus a parent failure): the exclusion inventory expected only the old property guards, and readiness expected success before the new migration. Tests now retain all old property checks, additionally verify the usage exclusion, and require the usage migration before readiness becomes 200. The temporary appended-migration timestamp also moves after Phase 6A. No test was deleted or weakened. The complete suite was rerun successfully afterward.
+
+Task changes are confined to the usage schema/migration/services/routes/tests, planner accounting integration, role/config/readiness wiring, three existing migration/security test fixtures, `.env.example`, README and `docs/BUILD_PLAN.md`. The package manifest and lockfile remain exactly as they were at task start. The build-plan file is locally updated but remains ignored by the existing `.gitignore`. Nothing was committed or pushed. The disposable cluster is stopped and its data removed; audit logs and probe artifacts remain outside the repository. Production readiness and real-provider pricing/transport acceptance are not claimed.
+
+## Phase 6B: inbound WhatsApp pilot
+
+The backend now receives signed Meta WhatsApp Cloud API webhooks and records text messages for staff review. It does **not** call a model, send replies, mark messages read, create holds or change payments. Existing simulation processing remains separate. Inbound conversations have `channel=WHATSAPP`, `simulation=false`, `handlingMode=HUMAN` and `modelProvider=disabled` in staff responses. Here `simulation=false` distinguishes external channel ingress from staff simulation turns; **all Phase 6B number mappings use SIMULATION usage accounting**, never production billing. Live customer activation remains outside this phase.
+
+### Endpoints and setup
+
+| Endpoint | Access / behavior |
+| --- | --- |
+| `GET /api/webhooks/whatsapp` | Meta subscription handshake: `hub.mode=subscribe`, matching `hub.verify_token`, numeric `hub.challenge`; returns the challenge unchanged as plain text |
+| `POST /api/webhooks/whatsapp` | Meta HMAC-SHA256 signature in `X-Hub-Signature-256`; JSON body up to 131,072 bytes |
+| `GET /api/whatsapp/connections?limit=50&offset=0` | OWNER/MANAGER: list only their tenant's mappings; no credentials |
+| `POST /api/whatsapp/connections` | OWNER/MANAGER: create `{ "businessId": "<WABA_ID>", "phoneNumberId": "<PHONE_NUMBER_ID>", "displayName": "Pilot number", "isActive": false }`; replace placeholders with Meta's numeric IDs |
+| `PATCH /api/whatsapp/connections/:connectionId` | OWNER/MANAGER: change `isActive` and/or `displayName`; tenant, channel and number identity cannot be reassigned |
+| Existing `GET /api/conversations`, `/:conversationId`, `/:conversationId/messages`, `/:conversationId/escalations` | All authenticated staff roles: includes their tenant's inbound WhatsApp conversations; foreign IDs return `404` |
+
+After reviewing/applying the migration in your **local disposable development database**, generate the client with `npx prisma generate`. Configure `META_WEBHOOK_ENABLED=true`, `META_APP_SECRET` from your test Meta app, and `META_VERIFY_TOKEN` with a random value you choose (32–512 letters, digits, underscores or hyphens). The app secret accepts 16–512 characters in that alphabet. Set the same verify token in Meta. Both secrets are required when enabling the webhook; configuration also requires `AI_PROVIDER=mock` and `PAYSTACK_TEST_ENABLED=false`. Disabled or missing runtime configuration returns `503 WHATSAPP_WEBHOOK_UNAVAILABLE`. Application liveness remains independent of the database; readiness now requires the Phase 6B table as well.
+
+Through an authenticated OWNER/MANAGER account, register the test number's **phone number ID** and **WhatsApp Business Account ID**, not its displayed phone number. Mappings default to inactive. Independently verify the operator's ownership before activating a pilot mapping with `PATCH { "isActive": true }`. This administrative API does not prove Meta ownership, implement Embedded Signup or discover numbers. Several numbers may share a business ID and tenant. A number already assigned to any tenant, even inactive, cannot be claimed again; there is no deletion/reassignment API.
+
+Configure the existing Phase 6A SIMULATION usage policy through `PUT /api/usage/policy/SIMULATION` before testing. No additional quotas, pricing or budgets are introduced. Without a policy or when the conversation allowance is exhausted, the incoming message remains available for staff review with a BLOCKED usage receipt and the existing usage alert. It does not create a new usage window or model call. Existing development defaults remain available through the existing usage service, but webhook ingestion does not silently provision them.
+
+When you later supply a reachable HTTPS callback, use `https://<your-test-host>/api/webhooks/whatsapp` for the Meta app's WhatsApp webhooks and subscribe to `messages`. No Graph access token or API version is required merely to receive signed events. No callback, tunnel, Meta account setting or deployment was created during implementation. External handshake/delivery is **unverified**. Meta's [official archived SDK webhook reference](https://whatsapp.github.io/WhatsApp-Nodejs-SDK/api-reference/webhooks/start/) describes the challenge and signature handshake; current [messages](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/reference/messages) and [echo](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/reference/smb_message_echoes) pages returned HTTP 429 during review. Automated fixtures verify the implemented contract, not current external delivery.
+
+### Validation, privacy and transaction behavior
+
+The route's encapsulated Fastify buffer parser preserves exactly the original signed bytes. HMAC comparison is constant-time, and signature validation occurs before JSON parsing or trusting payload fields. Verification tokens are compared through equal-length SHA-256 digests. Request logging omits query strings, headers and bodies so Meta's verification token cannot enter access logs. Existing Paystack parsing and authenticated JSON routes remain separate.
+
+The payload must identify `whatsapp_business_account`. Each text message needs a bounded Meta message ID, numeric international sender identity, valid Unix timestamp and nonempty text of at most **2,000 JavaScript string units** (the existing conversation privacy limit). There are at most 100 normalized events per request. UTC timestamps before 2000 or more than five minutes ahead of receipt are rejected. Delayed events are accepted; usage windows use server processing time, not guest-supplied timestamps. Clock synchronization remains operationally necessary. Earlier processing times cannot move an existing window's deadline backwards.
+
+Tenant identity comes from the uniquely registered `metadata.phone_number_id`; the envelope business ID must match that mapping. Payload tenant IDs and profile/contact names are ignored. Senders normalize to the existing `+<country code><number>` identity. Numeric phone identities only are supported; username/business-scoped identities are not guessed. Text passes through existing heuristic redaction before `Message` storage. The normalized guest phone remains in the tenant-owned `Conversation`; the original Meta message ID and UTC event/receipt timestamps are stored in `WhatsAppInbound`. Names are not inferred. Redaction is heuristic, not a guarantee of complete removal of personal information.
+
+`WebhookEvent` stores a SHA-256 body digest and bounded outcome counts, **never the raw payload**, despite the historical JSON column name `rawBody`. Distinct outcomes include `RECORDED`, `RECORDED_USAGE_BLOCKED`, `DUPLICATE`, `MESSAGE_ID_CONFLICT`, `UNKNOWN_NUMBER`, `INACTIVE_NUMBER`, `BUSINESS_MISMATCH`, `CONVERSATION_CONFLICT`, `STATUS`, `ECHO`, `UNSUPPORTED` and `MALFORMED`. Statuses, media, outbound echoes (`smb_message_echoes` or `is_echo`) and other unsupported changes do not create conversations or usage. Unknown/inactive/mismatched mappings are safely quarantined as receipt outcomes, without retaining guest payloads or assigning a guessed tenant.
+
+A valid signature is required even for malformed JSON. Missing/invalid signatures return `401`; malformed signed payloads return `400` with a durable safe receipt; oversized requests return `413`. Supported messages and safe ignored/quarantined outcomes return `200 { "received": true }` only after persistence. This acknowledgement means receipt, not a reply, reservation or confirmed booking.
+
+Receipt insertion uses PostgreSQL `ON CONFLICT DO NOTHING`. Processing acquires the existing usage-mode advisory transaction lock, then receipt and connection row locks. The entire batch's conversations, messages, deduplication rows, usage receipts/windows and audit records commit together. A database/audit failure rolls those business writes back, leaves a safe RETRY marker when the database permits, and returns `503 WEBHOOK_RETRY_REQUIRED`. If even receipt persistence fails, no success is acknowledged. The provider must redeliver the signed payload; there is no background worker or locally retained raw payload for autonomous replay. Quarantined terminal deliveries are not automatically replayed after mapping corrections.
+
+Deduplication uses `(tenantId, phoneNumberId, metaMessageId)`. Repackaging the same message in a different webhook envelope cannot add a message, usage receipt or window, or extend the 24-hour inactivity deadline. Reuse with changed content is quarantined without overwriting history. The existing Phase 6A counting primitive is shared; there is no second conversation counter. Distinct numbers for the same tenant and guest retain separate message histories but share Phase 6A's tenant/channel/guest usage identity. Authenticated actors audit mapping changes; system actors audit inbound processing and accounting, with the resolved tenant and without message bodies or contact values.
+
+### Migration and operational boundaries
+
+New migration: `20261102000100_whatsapp_inbound`. It adds `WhatsAppInbound`, composite foreign keys to the exact tenant/connection/number and tenant/conversation/message, a tenant/time index, and scoped message-ID uniqueness. Existing `Message.providerId` global uniqueness is preserved; inbound uses a tenant/number/message-derived provider key and separately retains the original Meta ID. Additional composite unique indexes support the new foreign keys.
+
+The old `(channel, externalBusinessId)` unique index becomes a normal lookup index so one WhatsApp business can have several numbers. SQL-only `ChannelConnection_other_business_key` preserves the old business-ID uniqueness for other channels. `(channel, externalPhoneNumberId)` is unique across both active and inactive mappings. `ChannelConnection_whatsapp_values` rejects active mappings without a valid number/business ID; inactive legacy rows with a null number remain preserved. `WhatsAppInbound_values` validates hashes, message type, usage status and timestamp bounds. The `whatsapp_connection_guard` trigger calls `protect_whatsapp_connection()` to prevent reassignment of existing WhatsApp identity/ownership; its search path is pinned to `pg_catalog`, the protected schema, then `pg_temp`, and it remains SECURITY INVOKER.
+
+The migration runs inside `BEGIN/COMMIT`. Duplicate legacy phone mappings, malformed non-null IDs, or active mappings without a number cause a complete rollback. Do not automatically delete/reassign valuable mappings. Inspect and resolve ownership offline, then follow the documented Prisma failed-migration recovery workflow (`migrate resolve --rolled-back` only after verified rollback/repair, then `migrate deploy`). Tests perform this solely on synthetic disposable data. Never use `db push` as a substitute for migration history: Prisma does not describe the CHECK constraints, partial indexes or trigger functions. Preserve those SQL safeguards in future migrations and rerun the temporary-copy migration probe.
+
+Database constraints protect ownership links, uniqueness and row shape; the application's transaction protocol protects shared counting, active-mapping checks, channel semantics and audit atomicity. A privileged raw SQL writer can bypass application authorization/accounting. Other limitations: no production mapping mode, external transport acceptance, automated replay/alerts, media handling, retention policy, distributed rate limiting or throughput/load acceptance. The existing in-process 120 requests/minute limiter remains in force, including webhook delivery. Staff must poll the existing inbox; no guest or staff notifications are sent. Do not enable live customers or Phase 6C processing based only on fixture tests.
+
+### Phase 6B verification record — 2026-11-02
+
+Pre-implementation state: `main`, commit `5ee928f`, with existing uncommitted Phase 6A and dependency-override work. That work was preserved. No dependency was installed or upgraded. SHA-256 checks confirm all eight pre-existing SQL migrations, `package.json`, `package-lock.json`, `.env`, booking/payment services and conversation tools remain byte-for-byte unchanged from this task's start. `deepmerge-ts@8.0.2` remains overridden; Prisma/client/config remain `6.19.3`. Phase 5 selection/consent, saved-plan replay, redaction, lease and takeover regressions remain present and passed.
+
+Verification used a newly initialized disposable PostgreSQL cluster bound only to `127.0.0.1:55454`, never the application database URL from `.env`. Test commands explicitly used `AI_PROVIDER=mock`, `PAYSTACK_TEST_ENABLED=false`, `LC_ALL=C` and these local test URLs:
+
+```text
+DATABASE_URL=postgresql://override_test@127.0.0.1:55454/override_verified?schema=public
+TEST_DATABASE_URL=postgresql://override_test@127.0.0.1:55454/override_test?schema=public
+SHADOW_DATABASE_URL=postgresql://override_test@127.0.0.1:55454/override_shadow?schema=public
+```
+
+The integration helper creates/removes randomly named schemas within the disposable database. The migration-dev probe used the separate `override_probe` database and a schema/migration copy outside the repository. All verification logs, exact argument arrays/exit codes, source-preservation hashes and catalog snapshots are retained in `/Users/apple/.codex/audit-artifacts/shortlet-phase6b-3rasfasy/`; `commands.jsonl` is the command ledger and `changed-files.json` lists this task's 24 changed files.
+
+| Command | Actual result |
+| --- | --- |
+| `npm run build` | Exit 0, including a final build after timestamp review |
+| `npm test` | Exit 0: **49 passed, 0 failed, 0 skipped, 0 cancelled** |
+| `npm run test:integration` | Exit 0: **183 passed, 0 failed, 0 skipped, 0 cancelled**; 510.651 seconds |
+| `npx tsx --test --test-concurrency=1 test/integration/phase-five.test.ts test/integration/phase-six-a.test.ts test/integration/phase-six-b.test.ts` | Exit 0: **67 passed, 0 failed, 0 skipped, 0 cancelled**, after final timestamp guards |
+| `npx prisma validate` | Exit 0, valid schema |
+| `npx prisma generate` | Exit 0, Prisma Client 6.19.3 generated |
+| `npx prisma migrate deploy` | Exit 0, fresh nine-migration deployment and final no-pending check |
+| `npx prisma migrate status` | Exit 0, up to date |
+| `npx prisma migrate diff --from-url "$DATABASE_URL" --to-schema-datamodel prisma/schema.prisma --exit-code` | Exit 0, no difference detected |
+| `git diff --check` | Exit 0 |
+| `npm audit` | Exit 0, **0 vulnerabilities** |
+| `npm audit --omit=dev` | Exit 0, **0 vulnerabilities** |
+| `npm ls prisma @prisma/client @prisma/config deepmerge-ts` | Exit 0, existing versions/override preserved |
+
+The temporary-copy probe ran `npx prisma migrate deploy --schema <artifact>/migration-probe/schema.prisma`, followed by `npx prisma migrate dev --schema <artifact>/migration-probe/schema.prisma --name whatsapp_inbound_probe --skip-generate` and `npx prisma migrate status --schema <artifact>/migration-probe/schema.prisma`; all exited 0. A harmless nullable column existed only in that copy. Before/after catalog comparisons preserved **198 functions (including 10 application functions), their owners/ACLs/security/search paths, 96 constraints, eight enabled triggers, 105 indexes and all nine existing migration-history records**, with one additional successful temporary migration. Source migration bytes were unchanged. The migration integration test additionally proved that duplicate legacy numbers and an active null-number mapping reject the upgrade atomically, leave the earlier schema/data intact, and recover successfully after explicit fixture repair and `migrate resolve --rolled-back`.
+
+Development failures were retained and fixed rather than hidden:
+
+| Initial command / log | Result and resolution |
+| --- | --- |
+| `npx tsx --test --test-concurrency=1 test/integration/phase-six-b.test.ts test/integration/phase-six-a.test.ts` (`focused-initial.log`) | Exit 1: **31 passed, 3 failed, 0 skipped**. Two child failures plus their parent exposed earlier ingress clocks moving a usage window backwards and violating its SQL check. The shared primitive now keeps its timestamp/deadline monotonic. |
+| `npx tsx --test --test-concurrency=1 test/integration/phase-six-b.test.ts test/integration/phase-six-a.test.ts test/integration/phase-six-b-migrations.test.ts test/integration/phase-six-a-migrations.test.ts` (`focused-second.log`) | Exit 1: **37 passed, 2 failed, 0 skipped**. One new expiry test selected an unrelated receipt when timestamps tied, plus its parent failure. The fixture now selects the exact guest identity; migration tests passed. |
+| `npx tsx --test --test-concurrency=1 test/integration/phase-six-b.test.ts` (`focused-third.log`) | Exit 1: **18 passed, 2 failed, 0 skipped**. The concurrent-delivery child test and parent exposed Prisma's empty-update upsert racing on initial receipt insertion. PostgreSQL confirmed `WebhookEvent_provider_eventId_key` rejection. Replaced with atomic insert-on-conflict; the test now runs five separate rounds of three competing deliveries. |
+| Same focused command (`focused-fourth.log`) | Exit 0: **20 passed, 0 failed, 0 skipped**. Later month-boundary coverage and conversation timestamp assertions also passed in the final 67-test regression run. |
+
+The six new unit tests cover exact-byte signatures, safe token comparison, normalization/redaction, date/size limits, explicit status/media/echo handling, configuration gates and access-log privacy. The new PostgreSQL tests cover tenant resolution/spoofing, roles, all read routes, unknown/inactive mappings, duplicate/repackaged/conflicting/concurrent delivery, blocked accounting, timestamps/expiry, failed transaction/batch rollback and redelivery, database unavailability, SQL constraints and migration failure/recovery. Earlier tests were retained: the Phase 2 readiness test now requires the new migration, the appended migration probe sorts after it, and the Phase 6A migration test uses a temporary history copy ending at its own phase so its original preservation assertions remain intact.
+
+Files changed in this task (separate from the pre-existing dirty tree):
+
+| Files | Purpose |
+| --- | --- |
+| `.env.example`, `src/config.ts`, `src/app.ts` | Disabled-by-default webhook configuration, safe request logs and plugin registration |
+| `src/routes/whatsapp-webhook.ts`, `src/services/whatsapp-validation.ts`, `src/services/whatsapp-webhook.ts` | Verification, raw-byte authentication, normalization and durable transactional ingestion |
+| `src/routes/whatsapp-connections.ts`, `src/services/whatsapp-connections.ts`, `src/services/authorization.ts`, `src/routes/operator.ts` | Tenant-scoped OWNER/MANAGER mapping administration and audited changes |
+| `src/services/usage-inbound.ts`, `src/services/usage-service.ts` | Shared Phase 6A accounting/locking primitive and monotonic inactivity timestamps |
+| `src/services/conversation-service.ts` | Read-only inbound history alongside existing simulations; mutation boundaries retained |
+| `prisma/schema.prisma`, `prisma/migrations/20261102000100_whatsapp_inbound/migration.sql`, `src/routes/health.ts` | Inbound persistence, mapping integrity and schema readiness |
+| `test/whatsapp.test.ts`, `test/integration/phase-six-b.test.ts`, `test/integration/phase-six-b-migrations.test.ts` | New security, normalization, concurrency, accounting and migration regressions |
+| `test/integration/phase-two-migrations.test.ts`, `test/integration/phase-three-acceptance-migrations.test.ts`, `test/integration/phase-six-a-migrations.test.ts` | Preserve earlier assertions across the new migration boundary |
+| `README.md`, `docs/BUILD_PLAN.md` | Implemented scope, API/setup instructions, limitations and actual results; build plan remains ignored by the existing `.gitignore` |
+
+No real AI calls, outbound WhatsApp messages, live payments, valuable/production database mutations, commits, pushes or deployments occurred. No real credentials or guest messages were used as test fixtures. External Meta delivery, live ownership verification and production activation remain untested. Phase 6C has not started.

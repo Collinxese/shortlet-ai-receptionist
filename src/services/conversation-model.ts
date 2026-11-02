@@ -1,14 +1,17 @@
 import { z } from 'zod';
+import { MockUsageFailure } from './usage-service.js';
 import { modelPlanSchema, plan, type Inquiry } from './conversation-validation.js';
 
 export type ModelContext = { message: string; inquiry: Inquiry; hasHold: boolean; hasQuote: boolean; hasConsent: boolean;
   hasName: boolean; hasPhone: boolean; today: string };
-export interface ConversationModel { readonly name: string; plan(context: ModelContext, signal: AbortSignal): Promise<unknown> }
+export interface ConversationModel { readonly name: string; readonly usageFixture?: { inputTokens: number; outputTokens: number }; plan(context: ModelContext, signal: AbortSignal): Promise<unknown> }
 
 /** Explicitly a deterministic development adapter, not a trained model. */
 export class MockConversationModel implements ConversationModel {
   readonly name = 'mock';
+  constructor(readonly usageFixture = { inputTokens: 128, outputTokens: 64 }, private readonly outcome: 'complete' | 'known_failure' | 'unknown' = 'complete') {}
   async plan(context: ModelContext) {
+    if (this.outcome !== 'complete') throw new MockUsageFailure(this.outcome === 'known_failure');
     const text = context.message;
     if (/human|person|manager|dispute|complaint/i.test(text)) return plan('request_human_assistance');
     if (/paid|payment status|receipt|screenshot/i.test(text)) return plan('check_payment_status');
