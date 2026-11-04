@@ -16,6 +16,11 @@ const migration = '20261025000200_booking_acceptance_guards';
 const cli = (databaseUrl: string, ...args: string[]) => execFileSync(process.execPath, ['node_modules/prisma/build/index.js', ...args], {
   env: { ...process.env, DATABASE_URL: databaseUrl }, stdio: 'pipe', encoding: 'utf8'
 });
+const cliWithShadow = (databaseUrl: string, shadowDatabaseUrl: string, ...args: string[]) =>
+  execFileSync(process.execPath, ['node_modules/prisma/build/index.js', ...args], {
+    env: { ...process.env, DATABASE_URL: databaseUrl, SHADOW_DATABASE_URL: shadowDatabaseUrl },
+    stdio: 'pipe', encoding: 'utf8'
+  });
 
 async function phaseThree(t: TestContext) {
   const context = await isolatedDatabase(t);
@@ -94,20 +99,21 @@ test('acceptance migration rejects newly equivalent active phones atomically and
 });
 
 test('Prisma shadow replay and an appended generated migration preserve all SQL-only safeguards', async (t) => {
-  const target = await isolatedDatabase(t), shadow = await isolatedDatabase(t);
+  const target = await isolatedDatabase(t);
   target.deploy();
   const before = await catalog(target.db);
   const originalSchema = await readFile('prisma/schema.prisma', 'utf8');
   const directory = await mkdtemp(join(tmpdir(), 'shortlet-acceptance-migration-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   await cp('prisma/migrations', join(directory, 'migrations'), { recursive: true });
+  const sourceSchemaPath = join(directory, 'source-schema.prisma');
   const schemaPath = join(directory, 'schema.prisma');
-  // Test-only nullable column in a temporary schema copy, never a product change.
-  await writeFile(schemaPath, originalSchema.replace('model Booking {', 'model Booking {\n  acceptanceAuditProbe String?'));
-  // Match the model's default schema to the replay schema during diff. Different
-  // generated schema names would describe a schema move rather than a new column.
-  const generated = cli(shadow.databaseUrl, 'migrate', 'diff', '--from-migrations', 'prisma/migrations',
-    '--to-schema-datamodel', schemaPath, '--shadow-database-url', shadow.databaseUrl, '--script');
+  // Compare temporary schema copies to generate additive SQL without putting a
+  // shadow database URL in Prisma's process arguments.
+  await writeFile(sourceSchemaPath, originalSchema);
+  await writeFile(schemaPath, originalSchema.replace('model Booking {', 'model Booking {\\n  acceptanceAuditProbe String?'));
+  const generated = cli(target.databaseUrl, 'migrate', 'diff', '--from-schema-datamodel', sourceSchemaPath,
+    '--to-schema-datamodel', schemaPath, '--script');
   assert.match(generated, /ADD COLUMN\s+"acceptanceAuditProbe"\s+TEXT/);
   assert.doesNotMatch(generated, /DROP (?:TRIGGER|FUNCTION|CONSTRAINT|INDEX)/);
   const nextMigration = join(directory, 'migrations', '20261102000400_acceptance_probe');

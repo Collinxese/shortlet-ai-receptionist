@@ -2,11 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
+import { unavailableDatabase } from './fixtures/unavailable-database.js';
 
 test('application health stays up while an unreachable database makes readiness fail safely', async (t) => {
   const app = await buildApp(loadConfig({
-    NODE_ENV: 'test', DATABASE_URL: 'postgresql://unavailable:unavailable@127.0.0.1:1/unavailable?connect_timeout=1'
-  }), { logger: false });
+    NODE_ENV: 'test', DATABASE_URL: 'postgresql://unavailable.invalid/not-connected'
+  }), { db: unavailableDatabase(), logger: false });
   t.after(() => app.close());
   const health = await app.inject('/api/health');
   assert.equal(health.statusCode, 200);

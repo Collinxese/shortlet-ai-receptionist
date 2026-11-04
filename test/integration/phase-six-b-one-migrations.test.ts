@@ -57,5 +57,5 @@ test('ownership migration preserves legacy provenance and SQL; injected failure 
  await assert.rejects(db.channelConnection.update({where:{id:connection.id},data:{isActive:true}}),/ChannelConnection_ownership_values/);
  await assert.rejects(db.usageWindow.update({where:{id:'internal'},data:{source:'META_PRODUCTION'}}),/UsageWindow_source_values/);
  assert.match(cli('migrate','status'),/Database schema is up to date/);
- let diff:string;try{diff=execFileSync(process.execPath,['node_modules/prisma/build/index.js','migrate','diff','--from-url',c.databaseUrl,'--to-schema-datamodel',path,'--exit-code'],{env:{...process.env,DATABASE_URL:c.databaseUrl},encoding:'utf8',stdio:'pipe'});}catch(error){const result=error as {stdout?:Buffer;stderr?:Buffer};assert.fail(String(result.stdout ?? '')+String(result.stderr ?? ''));}assert.match(diff,/No difference detected/);
+ let diff:string;try{diff=execFileSync(process.execPath,['node_modules/prisma/build/index.js','migrate','diff','--from-schema-datasource',path,'--to-schema-datamodel',path,'--exit-code'],{env:{...process.env,DATABASE_URL:c.databaseUrl},encoding:'utf8',stdio:'pipe'});}catch(error){const result=error as {stdout?:Buffer;stderr?:Buffer};assert.fail(String(result.stdout ?? '')+String(result.stderr ?? ''));}assert.match(diff,/No difference detected/);
 });
