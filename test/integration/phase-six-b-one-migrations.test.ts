@@ -13,7 +13,7 @@ test('ownership migration preserves legacy provenance and SQL; injected failure 
  const dir=await mkdtemp(join(tmpdir(),'ownership-migration-'));t.after(()=>rm(dir,{recursive:true,force:true}));
  await cp('prisma',dir,{recursive:true});const path=join(dir,'schema.prisma'),migrationPath=join(dir,'migrations',migration,'migration.sql');
  const sql=await readFile(migrationPath,'utf8');await rm(join(dir,'migrations',migration),{recursive:true});
- const cli=(...args:string[])=>execFileSync(process.execPath,['node_modules/prisma/build/index.js',...args,'--schema',path],{env:{...process.env,DATABASE_URL:c.databaseUrl},encoding:'utf8',stdio:'pipe'});
+ const cli=(...args:string[])=>execFileSync(process.execPath,['node_modules/prisma/build/index.js',...args,'--schema',path],{env:{...process.env,DATABASE_URL:c.databaseUrl,SHADOW_DATABASE_URL:c.databaseUrl},encoding:'utf8',stdio:'pipe'});
  cli('migrate','deploy');
  await db.$executeRaw`INSERT INTO "Tenant" (id,name,"updatedAt") VALUES ('legacy-owner','Legacy',NOW())`;
  await db.$executeRaw`INSERT INTO "ChannelConnection" (id,"tenantId",channel,"externalBusinessId","externalPhoneNumberId","isActive","lastVerifiedAt","updatedAt") VALUES ('legacy-connection','legacy-owner','WHATSAPP','1001','2001',true,NOW(),NOW())`;
@@ -57,5 +57,5 @@ test('ownership migration preserves legacy provenance and SQL; injected failure 
  await assert.rejects(db.channelConnection.update({where:{id:connection.id},data:{isActive:true}}),/ChannelConnection_ownership_values/);
  await assert.rejects(db.usageWindow.update({where:{id:'internal'},data:{source:'META_PRODUCTION'}}),/UsageWindow_source_values/);
  assert.match(cli('migrate','status'),/Database schema is up to date/);
- let diff:string;try{diff=execFileSync(process.execPath,['node_modules/prisma/build/index.js','migrate','diff','--from-url',c.databaseUrl,'--to-schema-datamodel',path,'--exit-code'],{env:{...process.env,DATABASE_URL:c.databaseUrl},encoding:'utf8',stdio:'pipe'});}catch(error){const result=error as {stdout?:Buffer;stderr?:Buffer};assert.fail(String(result.stdout ?? '')+String(result.stderr ?? ''));}assert.match(diff,/No difference detected/);
+ let diff:string;try{diff=cli('migrate','diff','--from-schema-datasource','--to-schema-datamodel',path,'--exit-code');}catch(error){const result=error as {stdout?:Buffer;stderr?:Buffer};assert.fail(String(result.stdout ?? '')+String(result.stderr ?? ''));}assert.match(diff,/No difference detected/);
 });
