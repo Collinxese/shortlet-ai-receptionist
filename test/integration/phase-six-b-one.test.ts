@@ -108,12 +108,17 @@ test('Phase 6B.1 ownership boundary, trusted classification and disabled product
  await t.test('verification provider failures cannot leak token or app secret into API responses or access logs',async()=>{
   const script=`import {buildApp} from './src/app.ts';import {loadConfig} from './src/config.ts';
    import {GraphWhatsAppOwnership,MetaCredentialStore} from './src/services/whatsapp-ownership.ts';
-   const verifier=new GraphWhatsAppOwnership(new MetaCredentialStore(${JSON.stringify(file)}),
-    {appId:'3001',appSecret:${JSON.stringify(secret)},version:'v23.0'},async()=>{throw new Error(${JSON.stringify(accessToken+secret)});});
-   const app=await buildApp(loadConfig({NODE_ENV:'test',DATABASE_URL:${JSON.stringify(databaseUrl)}}),{whatsappOwnership:verifier});
-   const response=await app.inject({method:'POST',url:${JSON.stringify('/api/whatsapp/connections/'+id+'/verify')},headers:{authorization:${JSON.stringify('Bearer '+a.token)}}});
-   console.log(response.statusCode,response.body);await app.close();`;
-  const output=execFileSync(process.execPath,['--import','tsx','--input-type=module','-e',script],{env:{...process.env,AI_PROVIDER:'mock',PAYSTACK_TEST_ENABLED:'false'},encoding:'utf8'});
+   const {TEST_META_CREDENTIAL_FILE,TEST_META_APP_SECRET,TEST_META_ACCESS_TOKEN,TEST_DATABASE_URL,TEST_CONNECTION_ID,TEST_AUTH_TOKEN}=process.env;
+   if(!TEST_META_CREDENTIAL_FILE||!TEST_META_APP_SECRET||!TEST_META_ACCESS_TOKEN||!TEST_DATABASE_URL||!TEST_CONNECTION_ID||!TEST_AUTH_TOKEN) throw new Error('Missing isolated child fixture environment');
+   const verifier=new GraphWhatsAppOwnership(new MetaCredentialStore(TEST_META_CREDENTIAL_FILE),
+    {appId:'3001',appSecret:TEST_META_APP_SECRET,version:'v23.0'},async()=>{throw new Error(TEST_META_ACCESS_TOKEN+TEST_META_APP_SECRET);});
+   const app=await buildApp(loadConfig({NODE_ENV:'test',DATABASE_URL:TEST_DATABASE_URL}),{whatsappOwnership:verifier});
+   try {const response=await app.inject({method:'POST',url:'/api/whatsapp/connections/'+TEST_CONNECTION_ID+'/verify',headers:{authorization:'Bearer '+TEST_AUTH_TOKEN}});
+    console.log(response.statusCode,response.body);} finally {await app.close();}`;
+  assert.ok(![file,secret,accessToken,databaseUrl,id,a.token].some(value=>script.includes(value)),'child source must not embed credentials or fixture identifiers');
+  const output=execFileSync(process.execPath,['--import','tsx','--input-type=module','-e',script],{env:{...process.env,AI_PROVIDER:'mock',PAYSTACK_TEST_ENABLED:'false',
+    TEST_META_CREDENTIAL_FILE:file,TEST_META_APP_SECRET:secret,TEST_META_ACCESS_TOKEN:accessToken+secret,TEST_DATABASE_URL:databaseUrl,
+    TEST_CONNECTION_ID:id,TEST_AUTH_TOKEN:a.token},encoding:'utf8'});
   assert.match(output,/503/);assert.match(output,/META_OWNERSHIP_VERIFICATION_FAILED/);assert.match(output,/incoming request/);
   for(const marker of [accessToken,secret,a.token]) assert.ok(!output.includes(marker));
  });
