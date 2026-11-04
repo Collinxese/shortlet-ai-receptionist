@@ -7,7 +7,7 @@ import { HttpError } from './errors.js';
 
 export const metaId = z.string().regex(/^[1-9][0-9]{0,31}$/);
 export const connectionBody = z.strictObject({ phoneNumberId: metaId, businessId: metaId,
-  displayName: z.string().trim().min(1).max(120).optional(), isActive: z.boolean().default(false) });
+  displayName: z.string().trim().min(1).max(120).optional(), isActive: z.literal(false).default(false) });
 export const connectionPatch = z.strictObject({ isActive: z.boolean().optional(),
   displayName: z.string().trim().min(1).max(120).optional() }).refine(v => Object.keys(v).length > 0);
 export const connectionParams = z.strictObject({ connectionId: id });

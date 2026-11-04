@@ -110,7 +110,7 @@ test('Prisma shadow replay and an appended generated migration preserve all SQL-
     '--to-schema-datamodel', schemaPath, '--shadow-database-url', shadow.databaseUrl, '--script');
   assert.match(generated, /ADD COLUMN\s+"acceptanceAuditProbe"\s+TEXT/);
   assert.doesNotMatch(generated, /DROP (?:TRIGGER|FUNCTION|CONSTRAINT|INDEX)/);
-  const nextMigration = join(directory, 'migrations', '20261102000200_acceptance_probe');
+  const nextMigration = join(directory, 'migrations', '20261102000400_acceptance_probe');
   await mkdir(nextMigration);
   await writeFile(join(nextMigration, 'migration.sql'), generated);
   assert.match(cli(target.databaseUrl, 'migrate', 'deploy', '--schema', schemaPath), /All migrations have been successfully applied/);

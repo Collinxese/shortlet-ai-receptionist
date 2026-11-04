@@ -1,3 +1,4 @@
+import { GraphWhatsAppOwnership, MetaCredentialStore, type WhatsAppOwnership } from './services/whatsapp-ownership.js';
 import { whatsappWebhookRoutes } from './routes/whatsapp-webhook.js';
 import Fastify from 'fastify';
 import helmet from '@fastify/helmet';
@@ -14,7 +15,7 @@ import { PaystackTestProvider, type PaymentProvider } from './services/payment-p
 import { paymentWebhookRoutes } from './routes/payment-webhook.js';
 import { MockConversationModel, OpenAIConversationModel, type ConversationModel } from './services/conversation-model.js';
 
-export async function buildApp(config: AppConfig, options: { db?: PrismaClient; logger?: boolean; paymentProvider?: PaymentProvider; conversationModel?: ConversationModel } = {}) {
+export async function buildApp(config: AppConfig, options: { db?: PrismaClient; logger?: boolean; paymentProvider?: PaymentProvider; conversationModel?: ConversationModel; whatsappOwnership?:WhatsAppOwnership } = {}) {
   const db = options.db ?? new PrismaClient({ datasourceUrl: config.DATABASE_URL });
   const app = Fastify({
     logger: options.logger === false ? false : {
@@ -75,12 +76,14 @@ export async function buildApp(config: AppConfig, options: { db?: PrismaClient; 
   const paymentProvider = config.PAYSTACK_TEST_ENABLED ? options.paymentProvider ?? new PaystackTestProvider(config.PAYSTACK_TEST_SECRET_KEY!) : undefined;
   const conversationModel = options.conversationModel ?? (config.AI_PROVIDER === 'openai' ? new OpenAIConversationModel(config.OPENAI_API_KEY!,config.AI_MODEL!) :
     config.AI_PROVIDER === 'mock' ? new MockConversationModel() : { name: 'disabled', async plan() { throw new Error('MODEL_UNAVAILABLE'); } });
+  const whatsappOwnership=options.whatsappOwnership ?? new GraphWhatsAppOwnership(new MetaCredentialStore(config.META_CREDENTIALS_FILE),
+    {appId:config.META_APP_ID,appSecret:config.META_APP_SECRET,version:config.META_GRAPH_VERSION});
   await app.register(healthRoutes, { prefix: '/api', db });
   await app.register(authRoutes, { prefix: '/api/auth', authentication, authRateLimitMax: config.AUTH_RATE_LIMIT_MAX });
-  await app.register(operatorRoutes, { prefix: '/api', db, authentication, paymentProvider, conversationModel, modelTimeoutMs: config.AI_TIMEOUT_MS, usageRuntime: { developmentDefaults: config.NODE_ENV !== 'production',
+  await app.register(operatorRoutes, { prefix: '/api', db, authentication, whatsappOwnership, paymentProvider, conversationModel, modelTimeoutMs: config.AI_TIMEOUT_MS, usageRuntime: { developmentDefaults: config.NODE_ENV !== 'production',
     productionGlobalCapMicroUsd: config.USAGE_PRODUCTION_GLOBAL_CAP_MICRO_USD === undefined ? undefined : BigInt(config.USAGE_PRODUCTION_GLOBAL_CAP_MICRO_USD),
     simulationGlobalCapMicroUsd: config.USAGE_SIMULATION_GLOBAL_CAP_MICRO_USD === undefined ? undefined : BigInt(config.USAGE_SIMULATION_GLOBAL_CAP_MICRO_USD) } });
   await app.register(paymentWebhookRoutes, { prefix: '/api/webhooks', db, paymentProvider, secret: config.PAYSTACK_TEST_SECRET_KEY });
-  await app.register(whatsappWebhookRoutes, { prefix: '/api/webhooks', db, enabled: config.META_WEBHOOK_ENABLED, secret: config.META_APP_SECRET, verifyToken: config.META_VERIFY_TOKEN });
+  await app.register(whatsappWebhookRoutes, { prefix: '/api/webhooks', db, ownership:whatsappOwnership, enabled: config.META_WEBHOOK_ENABLED, secret: config.META_APP_SECRET, verifyToken: config.META_VERIFY_TOKEN });
   return app;
 }

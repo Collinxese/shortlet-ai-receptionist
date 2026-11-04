@@ -79,9 +79,11 @@ export class UsageService {
       await this.lock(tx,mode);
       const { policy } = await this.configuration(tx,mode);
       const cost = await tx.usageEvent.aggregate({ where: { tenantId: this.tenantId, mode, periodStart: period.start }, _sum: { accountedMicroUsd: true } });
-      const conversations = await tx.usageWindow.count({ where: { tenantId: this.tenantId, mode, periodStart: period.start } });
+      const ticketsBySource=await tx.usageWindow.groupBy({by:['source'],where:{tenantId:this.tenantId,mode,periodStart:period.start},_count:true});
+      const countedSources=mode==='SIMULATION' ? ['INTERNAL_SIMULATION','LEGACY_MIXED']:['META_PRODUCTION'];
+      const conversations=ticketsBySource.filter(row=>countedSources.includes(row.source)).reduce((sum,row)=>sum+row._count,0);
       return usageJson({ mode, simulated: mode === 'SIMULATION', currency: 'USD', unit: 'micro-USD', period,
-        policy, accountedMicroUsd: cost._sum.accountedMicroUsd ?? 0n, conversations, provisional: true });
+        policy, ticketsBySource, accountedMicroUsd: cost._sum.accountedMicroUsd ?? 0n, conversations, provisional: true });
     },options);
   }
   async list(mode: UsageMode, limit: number) {

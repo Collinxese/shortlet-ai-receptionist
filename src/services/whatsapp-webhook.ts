@@ -1,3 +1,4 @@
+import { ownershipUnavailable, productionDisabled, type WhatsAppOwnership, type WhatsAppActivationPolicy, type WhatsAppEnvironment } from './whatsapp-ownership.js';
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { HttpError } from './errors.js';
 import { bodyDigest, identityDigest, normalizeMetaPayload, verifyMetaSignature, type InboundItem } from './whatsapp-validation.js';
@@ -8,7 +9,8 @@ const provider='META_WHATSAPP';
 const transactionOptions={isolationLevel:Prisma.TransactionIsolationLevel.ReadCommitted,maxWait:10000,timeout:10000};
 /** No model, booking, payment or outbound transport dependencies. */
 export class WhatsAppWebhook {
-  constructor(private readonly db: PrismaClient, private readonly secret: string, private readonly clock=()=>new Date()) {}
+  constructor(private readonly db: PrismaClient, private readonly secret: string, private readonly clock=()=>new Date(),private readonly ownership:WhatsAppOwnership=ownershipUnavailable,
+    private readonly activation:WhatsAppActivationPolicy=productionDisabled) {}
   async receive(raw: Buffer, signature: string | string[] | undefined) {
     verifyMetaSignature(raw,signature,this.secret);
     const eventId=bodyDigest(raw), receivedAt=this.clock();
@@ -23,6 +25,7 @@ export class WhatsAppWebhook {
       await this.db.$transaction(async tx=>{
         // Same mode lock as Phase 6A, then receipt -> connection -> conversation.
         await lockInboundUsage(tx,'SIMULATION');
+        await lockInboundUsage(tx,'PRODUCTION');
         await tx.$queryRaw`SELECT id FROM "WebhookEvent" WHERE id=${receipt.id} FOR UPDATE`;
         const current=await tx.webhookEvent.findUniqueOrThrow({where:{id:receipt.id}});
         if(current.status==='PROCESSED') return;
@@ -47,9 +50,16 @@ export class WhatsAppWebhook {
   private async record(tx: Prisma.TransactionClient,item: InboundItem,now: Date): Promise<string> {
     if(item.kind!=='TEXT') return item.kind;
     await tx.$queryRaw`SELECT id FROM "ChannelConnection" WHERE channel='WHATSAPP' AND "externalPhoneNumberId"=${item.phoneNumberId} FOR UPDATE`;
-    const connection=await tx.channelConnection.findUnique({where:{channel_externalPhoneNumberId:{channel:'WHATSAPP',externalPhoneNumberId:item.phoneNumberId}},select:{id:true,tenantId:true,isActive:true,externalBusinessId:true}});
+    const connection=await tx.channelConnection.findUnique({where:{channel_externalPhoneNumberId:{channel:'WHATSAPP',externalPhoneNumberId:item.phoneNumberId}},select:{id:true,tenantId:true,isActive:true,externalBusinessId:true,externalPhoneNumberId:true,whatsappState:true,whatsappEnvironment:true,lastVerifiedAt:true,verificationExpiresAt:true,credentialDigest:true}});
     if(!connection) return 'UNKNOWN_NUMBER';
-    if(!connection.isActive) return 'INACTIVE_NUMBER';
+    if(connection.whatsappState==='PENDING_VERIFICATION' || !connection.lastVerifiedAt) return 'UNVERIFIED_NUMBER';
+    if(!connection.isActive || connection.whatsappState!=='ACTIVE') return 'INACTIVE_NUMBER';
+    if(!connection.verificationExpiresAt || connection.verificationExpiresAt<=this.clock() || !connection.credentialDigest) return 'VERIFICATION_EXPIRED';
+    if(!['META_TEST','META_PRODUCTION'].includes(connection.whatsappEnvironment)) return 'UNVERIFIED_NUMBER';
+    if(connection.whatsappEnvironment==='META_PRODUCTION' && !this.activation.allowsProduction(connection)) return 'PRODUCTION_DISABLED';
+    if(!await this.ownership.current(connection,{environment:connection.whatsappEnvironment as WhatsAppEnvironment,
+      credentialDigest:connection.credentialDigest,expiresAt:connection.verificationExpiresAt})) return 'VERIFICATION_REVOKED';
+    const source=connection.whatsappEnvironment as WhatsAppEnvironment,mode=source==='META_TEST' ? 'SIMULATION':'PRODUCTION';
     if(connection.externalBusinessId!==item.businessId) return 'BUSINESS_MISMATCH';
     const tenantId=connection.tenantId;
     const old=await tx.whatsAppInbound.findUnique({where:{tenantId_phoneNumberId_metaMessageId:{tenantId,
@@ -63,22 +73,22 @@ export class WhatsAppWebhook {
     const audit=(entityId:string,action:string,after:Prisma.InputJsonObject)=>tx.auditLog.create({data:{tenantId,actorType:'SYSTEM',
       entityType:'WhatsAppInbound',entityId,action,after}});
     const accountingAt=this.clock();
-    const usage=await recordInboundUsage(tx,{tenantId,mode:'SIMULATION',now:accountingAt,
-      configuration:async()=>({policy:await tx.usagePolicy.findUnique({where:{tenantId_mode:{tenantId,mode:'SIMULATION'}}})}),
+    const usage=await recordInboundUsage(tx,{tenantId,mode,source,now:accountingAt,
+      configuration:async()=>({policy:await tx.usagePolicy.findUnique({where:{tenantId_mode:{tenantId,mode}}})}),
       audit,alert:async(code,threshold=0)=>{
-        const key={tenantId,mode:'SIMULATION',periodStart:usagePeriod(accountingAt).start,code,threshold};
+        const key={tenantId,mode,periodStart:usagePeriod(accountingAt).start,code,threshold};
         if(!await tx.usageAlert.findUnique({where:{tenantId_mode_periodStart_code_threshold:key}})) {
-          const alert=await tx.usageAlert.create({data:key});await audit(alert.id,'usage.alert',{mode:'SIMULATION',code,threshold});
+          const alert=await tx.usageAlert.create({data:key});await audit(alert.id,'usage.alert',{mode,source,code,threshold});
         }
       }},{phone:item.phone,eventId:identityDigest(['META_WHATSAPP',item.phoneNumberId,item.metaMessageId]),conversationId:conversation.id});
     const message=await tx.message.create({data:{tenantId,conversationId:conversation.id,direction:'IN',body:item.text,
       providerId:`whatsapp:${identityDigest([tenantId,item.phoneNumberId,item.metaMessageId])}`,createdAt:now}});
-    const inbound=await tx.whatsAppInbound.create({data:{tenantId,connectionId:connection.id,phoneNumberId:item.phoneNumberId,
+    const inbound=await tx.whatsAppInbound.create({data:{tenantId,source,connectionId:connection.id,phoneNumberId:item.phoneNumberId,
       metaMessageId:item.metaMessageId,inputHash:item.inputHash,conversationId:conversation.id,messageId:message.id,
       eventAt:item.eventAt,receivedAt:now,usageStatus:usage.status}});
     await tx.conversation.update({where:{id:conversation.id,tenantId},data:{lastMessageAt:conversation.lastMessageAt && conversation.lastMessageAt > now ? conversation.lastMessageAt : now,needsAttention:true}});
     await audit(inbound.id,'whatsapp.message_received',{conversationId:conversation.id,connectionId:connection.id,
-      accountingMode:'SIMULATION',usageStatus:usage.status});
+      accountingMode:mode,source,usageStatus:usage.status});
     return usage.status==='ACCEPTED' ? 'RECORDED':'RECORDED_USAGE_BLOCKED';
   }
 }

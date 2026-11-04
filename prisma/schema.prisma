@@ -332,6 +332,11 @@ model ChannelConnection {
   createdAt             DateTime  @default(now())
   updatedAt             DateTime  @updatedAt
 
+  whatsappState String @default("PENDING_VERIFICATION")
+  whatsappEnvironment String @default("UNCLASSIFIED")
+  verificationExpiresAt DateTime?
+  credentialDigest String?
+  verificationAttempt String?
   whatsappInbound WhatsAppInbound[]
 
   @@index([channel, externalBusinessId])
@@ -542,6 +547,7 @@ model UsageEvent {
 
 // Pseudonymous normalized identity; no guest text or raw phone in this ledger.
 model UsageWindow {
+  source String @default("INTERNAL_SIMULATION")
   id String @id @default(cuid())
   tenantId String
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
@@ -560,6 +566,7 @@ model UsageWindow {
 }
 
 model UsageInbound {
+  source String @default("INTERNAL_SIMULATION")
   id String @id @default(cuid())
   tenantId String
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
@@ -585,8 +592,9 @@ model UsageAlert {
   @@unique([tenantId, mode, periodStart, code, threshold])
 }
 
-// Phase 6B only ingests pilot/test numbers. Accounting is SIMULATION, never a charge.
+// Durable trusted ingress source; test traffic is non-billable. Production activation is disabled.
 model WhatsAppInbound {
+  source String @default("META_LEGACY_UNCLASSIFIED")
   id String @id @default(cuid())
   tenantId String
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)

@@ -25,7 +25,7 @@ All routes are under `/api`. Send JSON bodies with `Content-Type: application/js
 | Method / path | Access | Purpose |
 | --- | --- | --- |
 | `GET /health` | Public | Application liveness; independent of the database |
-| `GET /ready` | Public | `200` when PostgreSQL and required Phase 1–6B schema are reachable; otherwise `503` |
+| `GET /ready` | Public | `200` when PostgreSQL and required Phase 1–6B.1 schema are reachable; otherwise `503` |
 | `POST /auth/register` | Public, rate limited | Create a tenant and its OWNER atomically |
 | `POST /auth/login` | Public, rate limited | Authenticate an active operator |
 | `GET /auth/me` | Any authenticated role | Current operator and tenant ID |
@@ -592,7 +592,7 @@ Task changes are confined to the usage schema/migration/services/routes/tests, p
 
 ## Phase 6B: inbound WhatsApp pilot
 
-The backend now receives signed Meta WhatsApp Cloud API webhooks and records text messages for staff review. It does **not** call a model, send replies, mark messages read, create holds or change payments. Existing simulation processing remains separate. Inbound conversations have `channel=WHATSAPP`, `simulation=false`, `handlingMode=HUMAN` and `modelProvider=disabled` in staff responses. Here `simulation=false` distinguishes external channel ingress from staff simulation turns; **all Phase 6B number mappings use SIMULATION usage accounting**, never production billing. Live customer activation remains outside this phase.
+The backend now receives signed Meta WhatsApp Cloud API webhooks and records text messages for staff review. It does **not** call a model, send replies, mark messages read, create holds or change payments. Existing simulation processing remains separate. Inbound conversations have `channel=WHATSAPP`, `simulation=false`, `handlingMode=HUMAN` and `modelProvider=disabled` in staff responses. Here `simulation=false` distinguishes external channel ingress from staff simulation turns; **Phase 6B.1 adds trusted source labels**: internal simulations, Meta test traffic and production traffic are distinct. Test traffic remains non-billable; production activation is disabled. See the Phase 6B.1 section below for the current verification and accounting rules.
 
 ### Endpoints and setup
 
@@ -602,16 +602,17 @@ The backend now receives signed Meta WhatsApp Cloud API webhooks and records tex
 | `POST /api/webhooks/whatsapp` | Meta HMAC-SHA256 signature in `X-Hub-Signature-256`; JSON body up to 131,072 bytes |
 | `GET /api/whatsapp/connections?limit=50&offset=0` | OWNER/MANAGER: list only their tenant's mappings; no credentials |
 | `POST /api/whatsapp/connections` | OWNER/MANAGER: create `{ "businessId": "<WABA_ID>", "phoneNumberId": "<PHONE_NUMBER_ID>", "displayName": "Pilot number", "isActive": false }`; replace placeholders with Meta's numeric IDs |
-| `PATCH /api/whatsapp/connections/:connectionId` | OWNER/MANAGER: change `isActive` and/or `displayName`; tenant, channel and number identity cannot be reassigned |
+| `POST /api/whatsapp/connections/:connectionId/verify` | OWNER/MANAGER: empty body; checks server credentials and Graph asset access, leaves a successful connection VERIFIED and inactive |
+| `PATCH /api/whatsapp/connections/:connectionId` | OWNER/MANAGER: change `isActive` and/or `displayName`; activation requires current ownership proof; identity cannot be reassigned |
 | Existing `GET /api/conversations`, `/:conversationId`, `/:conversationId/messages`, `/:conversationId/escalations` | All authenticated staff roles: includes their tenant's inbound WhatsApp conversations; foreign IDs return `404` |
 
 After reviewing/applying the migration in your **local disposable development database**, generate the client with `npx prisma generate`. Configure `META_WEBHOOK_ENABLED=true`, `META_APP_SECRET` from your test Meta app, and `META_VERIFY_TOKEN` with a random value you choose (32–512 letters, digits, underscores or hyphens). The app secret accepts 16–512 characters in that alphabet. Set the same verify token in Meta. Both secrets are required when enabling the webhook; configuration also requires `AI_PROVIDER=mock` and `PAYSTACK_TEST_ENABLED=false`. Disabled or missing runtime configuration returns `503 WHATSAPP_WEBHOOK_UNAVAILABLE`. Application liveness remains independent of the database; readiness now requires the Phase 6B table as well.
 
-Through an authenticated OWNER/MANAGER account, register the test number's **phone number ID** and **WhatsApp Business Account ID**, not its displayed phone number. Mappings default to inactive. Independently verify the operator's ownership before activating a pilot mapping with `PATCH { "isActive": true }`. This administrative API does not prove Meta ownership, implement Embedded Signup or discover numbers. Several numbers may share a business ID and tenant. A number already assigned to any tenant, even inactive, cannot be claimed again; there is no deletion/reassignment API.
+Through an authenticated OWNER/MANAGER account, register the test number's **phone number ID** and **WhatsApp Business Account ID**, not its displayed phone number. Mappings begin PENDING_VERIFICATION and inactive. Follow the server-managed verification flow below before `PATCH { "isActive": true }`. Operator-supplied IDs are never ownership proof; there is no Embedded Signup or number discovery UI. Several numbers may share a business ID and tenant. A number already assigned to any tenant, even inactive, cannot be claimed again; there is no deletion/reassignment API.
 
-Configure the existing Phase 6A SIMULATION usage policy through `PUT /api/usage/policy/SIMULATION` before testing. No additional quotas, pricing or budgets are introduced. Without a policy or when the conversation allowance is exhausted, the incoming message remains available for staff review with a BLOCKED usage receipt and the existing usage alert. It does not create a new usage window or model call. Existing development defaults remain available through the existing usage service, but webhook ingestion does not silently provision them.
+Meta test ingress now records non-billable META_TEST tickets without consuming internal simulation or production allowances. No policy, price or quota is invented for this channel. Internal simulations retain their existing SIMULATION policy. The future production branch uses the existing PRODUCTION allowance and missing-policy BLOCKED behavior, but cannot be enabled by current application configuration.
 
-When you later supply a reachable HTTPS callback, use `https://<your-test-host>/api/webhooks/whatsapp` for the Meta app's WhatsApp webhooks and subscribe to `messages`. No Graph access token or API version is required merely to receive signed events. No callback, tunnel, Meta account setting or deployment was created during implementation. External handshake/delivery is **unverified**. Meta's [official archived SDK webhook reference](https://whatsapp.github.io/WhatsApp-Nodejs-SDK/api-reference/webhooks/start/) describes the challenge and signature handshake; current [messages](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/reference/messages) and [echo](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/reference/smb_message_echoes) pages returned HTTP 429 during review. Automated fixtures verify the implemented contract, not current external delivery.
+When you later supply a reachable HTTPS callback, use `https://<your-test-host>/api/webhooks/whatsapp` for the Meta app's WhatsApp webhooks and subscribe to `messages`. The webhook handshake itself needs no Graph access token, but normal guest processing now requires a verified connection and the Graph credentials described below. No callback, tunnel, Meta account setting or deployment was created during implementation. External handshake/delivery is **unverified**. Meta's [official archived SDK webhook reference](https://whatsapp.github.io/WhatsApp-Nodejs-SDK/api-reference/webhooks/start/) describes the challenge and signature handshake; current [messages](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/reference/messages) and [echo](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/reference/smb_message_echoes) pages returned HTTP 429 during review. Automated fixtures verify the implemented contract, not current external delivery.
 
 ### Validation, privacy and transaction behavior
 
@@ -627,7 +628,7 @@ A valid signature is required even for malformed JSON. Missing/invalid signature
 
 Receipt insertion uses PostgreSQL `ON CONFLICT DO NOTHING`. Processing acquires the existing usage-mode advisory transaction lock, then receipt and connection row locks. The entire batch's conversations, messages, deduplication rows, usage receipts/windows and audit records commit together. A database/audit failure rolls those business writes back, leaves a safe RETRY marker when the database permits, and returns `503 WEBHOOK_RETRY_REQUIRED`. If even receipt persistence fails, no success is acknowledged. The provider must redeliver the signed payload; there is no background worker or locally retained raw payload for autonomous replay. Quarantined terminal deliveries are not automatically replayed after mapping corrections.
 
-Deduplication uses `(tenantId, phoneNumberId, metaMessageId)`. Repackaging the same message in a different webhook envelope cannot add a message, usage receipt or window, or extend the 24-hour inactivity deadline. Reuse with changed content is quarantined without overwriting history. The existing Phase 6A counting primitive is shared; there is no second conversation counter. Distinct numbers for the same tenant and guest retain separate message histories but share Phase 6A's tenant/channel/guest usage identity. Authenticated actors audit mapping changes; system actors audit inbound processing and accounting, with the resolved tenant and without message bodies or contact values.
+Deduplication uses `(tenantId, phoneNumberId, metaMessageId)`. Repackaging the same message in a different webhook envelope cannot add a message, usage receipt or window, or extend the 24-hour inactivity deadline. Reuse with changed content is quarantined without overwriting history. The existing Phase 6A counting primitive is shared; there is no second conversation counter. Distinct numbers for the same tenant and guest retain separate message histories but share Phase 6A's tenant/channel/guest usage identity within the same trusted source classification. Authenticated actors audit mapping changes; system actors audit inbound processing and accounting, with the resolved tenant and without message bodies or contact values.
 
 ### Migration and operational boundaries
 
@@ -637,7 +638,7 @@ The old `(channel, externalBusinessId)` unique index becomes a normal lookup ind
 
 The migration runs inside `BEGIN/COMMIT`. Duplicate legacy phone mappings, malformed non-null IDs, or active mappings without a number cause a complete rollback. Do not automatically delete/reassign valuable mappings. Inspect and resolve ownership offline, then follow the documented Prisma failed-migration recovery workflow (`migrate resolve --rolled-back` only after verified rollback/repair, then `migrate deploy`). Tests perform this solely on synthetic disposable data. Never use `db push` as a substitute for migration history: Prisma does not describe the CHECK constraints, partial indexes or trigger functions. Preserve those SQL safeguards in future migrations and rerun the temporary-copy migration probe.
 
-Database constraints protect ownership links, uniqueness and row shape; the application's transaction protocol protects shared counting, active-mapping checks, channel semantics and audit atomicity. A privileged raw SQL writer can bypass application authorization/accounting. Other limitations: no production mapping mode, external transport acceptance, automated replay/alerts, media handling, retention policy, distributed rate limiting or throughput/load acceptance. The existing in-process 120 requests/minute limiter remains in force, including webhook delivery. Staff must poll the existing inbox; no guest or staff notifications are sent. Do not enable live customers or Phase 6C processing based only on fixture tests.
+Database constraints protect ownership links, uniqueness and row shape; the application's transaction protocol protects shared counting, active-mapping checks, channel semantics and audit atomicity. A privileged raw SQL writer can bypass application authorization/accounting. Other limitations: production activation remains disabled; external transport acceptance, automated replay/alerts, media handling, retention policy, distributed rate limiting or throughput/load acceptance. The existing in-process 120 requests/minute limiter remains in force, including webhook delivery. Staff must poll the existing inbox; no guest or staff notifications are sent. Do not enable live customers or Phase 6C processing based only on fixture tests.
 
 ### Phase 6B verification record — 2026-11-02
 
@@ -697,3 +698,133 @@ Files changed in this task (separate from the pre-existing dirty tree):
 | `README.md`, `docs/BUILD_PLAN.md` | Implemented scope, API/setup instructions, limitations and actual results; build plan remains ignored by the existing `.gitignore` |
 
 No real AI calls, outbound WhatsApp messages, live payments, valuable/production database mutations, commits, pushes or deployments occurred. No real credentials or guest messages were used as test fixtures. External Meta delivery, live ownership verification and production activation remain untested. Phase 6C has not started.
+
+
+## Phase 6B.1: ownership verification and inbound source classification
+
+This remediation starts from clean commit `d99c49c3788b7bcedaf8506fe720a0c9b411a4de`. It fixes two confirmed Phase 6B boundaries: tenant operators could activate a number using IDs alone, and genuine Meta test traffic was indistinguishable from internal simulations in the usage ledger. Existing Phase 5 remediation, Phase 6A accounting, historical migrations and exact `deepmerge-ts@8.0.2` override are preserved. No dependencies were added.
+
+### Ownership method and manual setup
+
+A Meta signature authenticates the sender of a webhook; it does not prove which SaaS tenant controls the number. Verification therefore requires **both** a platform-managed tenant/asset credential grant and read-only Graph checks. The tenant API cannot create grants or submit tokens, tenant IDs, source environments, proof timestamps or verification state.
+
+Provision these values using protected server configuration, never a repository file or tenant request:
+
+- `META_APP_ID`, the existing `META_APP_SECRET`, and an explicitly supported `META_GRAPH_VERSION` for your app (`vNN.0`). There is no assumed API-version default.
+- An access token for that app with `whatsapp_business_management` and authorized access to the intended WABA and phone-number asset. `whatsapp_business_messaging` alone is insufficient for these management reads. This code neither sends messages nor implements Embedded Signup.
+- `META_CREDENTIALS_FILE`: an absolute path to a server-owned secret mount **outside the repository**. The regular file must be owned by the process UID, have no group/world permissions (for example `0600`), and not be a symlink. Mount the actual file, not a symlink-based projected secret. Maximum size is 64 KiB / 100 grants. The service re-reads the protected file for activation and ingress; it never copies tokens into Prisma or API responses. Rotate the file atomically with the same ownership/mode: a partial write or unavailable file fails closed, and quarantined messages are not buffered for automatic replay.
+
+The platform administrator must independently establish the authorized delegation to the intended SaaS tenant and identify whether the asset is the app's development/test number. Store a JSON array of grants in that external secret mechanism; this is a format illustration with placeholders, **not a file to commit**:
+
+```json
+[
+  {
+    "tenantId": "<existing-tenant-id>",
+    "businessId": "<numeric-WABA-id>",
+    "phoneNumberId": "<numeric-phone-number-id>",
+    "environment": "META_TEST",
+    "accessToken": "<authorized-token-from-secret-manager>"
+  }
+]
+```
+
+Each phone-number ID may have only one grant. The matching tenant, WABA and phone must all agree with the authenticated tenant's stored connection before a network request is attempted. Graph then checks `/debug_token` validity, matching app ID, management scope, expiry/data-access expiry and granular WABA targets when returned; reads the expected WABA's ID; and finds the exact phone ID on that WABA's `/phone_numbers` edge. Requests use a fixed Graph origin, bounded cursor pagination, a 10-second timeout, 64-KiB response limits, bearer authentication and app-secret proof for asset requests. Redirects and provider error bodies never reach callers or logs. The stored proof contains only a credential fingerprint, source and expiry, capped at 24 hours or the earlier token/data-access expiry.
+
+The WABA and phone-number edge are documented in Meta's [official Cloud API collection](https://www.postman.com/meta/whatsapp-business-platform/documentation/wlk6lh4/whatsapp-cloud-api) and [official generated WABA SDK](https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/adobjects/whatsappbusinessaccount.py). The [official debug-token reference](https://developers.facebook.com/docs/graph-api/reference/debug_token/) returned HTTP 429 during this review. HTTP fixtures test this adapter; they do not establish real-world acceptance against the owner's assets.
+
+Current local configuration has only the webhook App Secret and verification token. It lacks the app ID, explicit API version and authorized tenant-bound access-token grant. **No real Graph ownership verification was attempted; connections stay pending until those requirements are met.** The real `.env` was preserved. Keep the Meta app unpublished, test number in development mode, `AI_PROVIDER=mock` and `PAYSTACK_TEST_ENABLED=false`.
+
+### State and activation rules
+
+1. Create a mapping: PENDING_VERIFICATION / inactive. `isActive:true` at creation is rejected.
+2. Call `POST /api/whatsapp/connections/:id/verify` with an empty body as OWNER/MANAGER. Verification first deactivates the connection and clears old proof. Success stores VERIFIED / inactive; any authorization, asset or configuration failure keeps it pending. Requests are limited to 10 per minute per existing Fastify client key.
+3. Explicitly activate with `PATCH { "isActive": true }`. Only current VERIFIED/ACTIVE proof and the unchanged server grant permit test activation. RECEPTIONIST cannot manage or verify connections. Cross-tenant IDs return 404.
+4. Deactivation leaves valid historical proof VERIFIED; it also cancels in-flight verification. Competing verifications use attempt identifiers, so a stale network result cannot undo a later deactivation/attempt. Graph calls run outside database transactions; row locks and audit writes protect the state changes.
+
+Ingress checks state, proof expiry, current secret grant, source, platform activation policy and WABA match before creating a conversation. Removing/rotating a grant stops future processing; proof expiration is checked from timestamps without a cleanup job. Pending, inactive, expired, revoked and production-disabled connections produce safe receipt outcomes and no ordinary conversations or tickets. Existing receipt deduplication and transactional retries remain unchanged. Environment changes that conflict with previously classified inbound history are rejected.
+
+**Production activation is hard-disabled in application wiring.** Neither a tenant request, DB policy nor environment variable enables it. Only an explicitly injected policy in disposable tests exercises the future branch. A platform code/policy change and separate approval are required before production ingress; a raw active DB flag alone cannot bypass the runtime gate.
+
+### Usage meaning and migration
+
+| Durable `source` | Financial bucket | Ticket behavior |
+| --- | --- | --- |
+| `INTERNAL_SIMULATION` | SIMULATION | Existing internal fixture allowances and rules |
+| `META_TEST` | SIMULATION (non-billable bucket) | Genuine test-channel ingress, separately counted; does not consume internal or production allowance and does not require/provision a usage policy |
+| `META_PRODUCTION` | PRODUCTION | Existing policy, allowance and Lagos billing-month rules, only behind the disabled production gate |
+| `META_LEGACY_UNCLASSIFIED` | Historical SIMULATION | Known historical Meta ingress; environment cannot be inferred reliably; separately reported, never reclassified as verified test or charged |
+| `LEGACY_MIXED` | Historical SIMULATION windows only | A historical window shared internal and Meta receipts; visibly mixed and conservatively retained in internal allowance counts |
+
+`UsageWindow`, `UsageInbound` and `WhatsAppInbound` persist the source. Summary `ticketsBySource` exposes the split; `conversations` counts the allowance-relevant sources only. The older `simulated` summary flag refers to the financial bucket, **not message origin**. Actual model costs remain in `UsageEvent`; WhatsApp ingress creates none. No new prices, budgets or quotas were introduced.
+
+Source-namespaced identities prevent a Meta test ticket sharing an internal simulation window. Within a source, the approved rolling 24-hour rule is unchanged: distinct eligible messages extend the inactivity deadline, duplicate/repackaged messages do not, and exact expiry starts a new ticket. Tickets remain attributed to the Lagos month in which they started. Missing/exhausted production policies produce the existing BLOCKED receipts and alerts without new windows; messages remain for human review. Both mode locks are acquired in fixed SIMULATION then PRODUCTION order for mixed webhook batches.
+
+Additive migration **`20261102000300_whatsapp_ownership_classification`** adds state/proof/source columns and four SQL checks: `ChannelConnection_ownership_values`, `UsageInbound_source_values`, `UsageWindow_source_values`, `WhatsAppInbound_source_values`. They enforce consistent active/proof state and valid source/bucket combinations. Unique number ownership, tenant foreign keys, deduplication and window exclusion remain unchanged. PostgreSQL checks validate proof shape, not external authorization; the server verifier owns authorization.
+
+All legacy WhatsApp mappings become inactive/pending with a SYSTEM audit recording their prior activation. Historical Meta receipts are identified from the exact old hashed Meta event keys; windows are labelled Meta-only or mixed as appropriate. Window identities are namespaced, while receipt keys, money, counts, dates and message history are preserved. Internal and mixed windows retain internal counting continuity. The first newly verified Meta event starts a window in its trusted source namespace; it does not relabel or reuse an unclassified historical window. Historical alerts/audits remain unchanged rather than being retroactively recalculated. Review this intentional deactivation before applying the migration. The migration uses BEGIN/COMMIT, so a failing upgrade cannot leave partially changed schema or records. Do not use `db push` to manage SQL-only safeguards; use reviewed migrations, and check SQL catalogs as well as Prisma's schema diff.
+
+Remaining limitations: platform grant provisioning is a trusted administrative process, not automated onboarding; a wrong administrator-supplied test/production label is not detected from webhook payloads. Meta-side token revocation may remain undetected until re-verification or proof expiry (at most 24 hours), unless the local grant is removed. Pending registrations reserve the unique number mapping; mistaken registrations require reviewed platform intervention because there is no reassignment endpoint. Expired connections require manual re-verification and activation; there is no refresh worker. Local permission checks assume a trusted server filesystem/process. Global ledger locks serialize ingress; distributed throttling, retention, monitoring and external webhook delivery still need operational acceptance. Terminal quarantined deliveries are not replayed automatically. No external ownership or inbound delivery success is claimed.
+
+
+### Phase 6B.1 changed files and verification record
+
+| Files | Why changed |
+| --- | --- |
+| `src/services/whatsapp-ownership.ts` (new) | Protected server grants, bounded Graph verification, proof freshness and disabled production policy |
+| `src/services/whatsapp-connections.ts`, `src/services/whatsapp-validation.ts`, `src/routes/whatsapp-connections.ts` | Pending/verified/active workflow, strict input, role/tenant checks, safe audits and verification route |
+| `src/app.ts`, `src/config.ts`, `src/routes/operator.ts`, `src/routes/whatsapp-webhook.ts`, `.env.example` | Wire the real verifier and placeholder-only configuration; retain provider injection for isolated tests |
+| `src/services/whatsapp-webhook.ts` | Require trusted current proof/source before processing; preserve HMAC, deduplication and atomic writes |
+| `src/services/usage-inbound.ts`, `src/services/usage-service.ts` | Persist source, separate counting identities/summary, preserve existing production rules and separate AI costs |
+| `prisma/schema.prisma`, `prisma/migrations/20261102000300_whatsapp_ownership_classification/migration.sql` (new), `src/routes/health.ts` | Additive state/source storage, safe historical backfill, SQL checks and readiness |
+| `test/whatsapp-ownership.test.ts`, `test/integration/phase-six-b-one.test.ts`, `test/integration/phase-six-b-one-migrations.test.ts` (new) | Graph authorization/secret protection, states/roles/tenant/privacy/accounting, rollback and historical data preservation |
+| `test/fixtures/whatsapp-ownership.ts` (new), `test/integration/phase-six-b.test.ts` | Give older ingress tests explicit synthetic verified connections; update test-channel accounting expectations |
+| `test/integration/phase-six-b-migrations.test.ts`, `test/integration/phase-two-migrations.test.ts`, `test/integration/phase-three-acceptance-migrations.test.ts` | Preserve historical migration boundaries/assertions and require new readiness columns |
+| `README.md`, `docs/BUILD_PLAN.md` | Current setup, implemented scope and results; build plan remains ignored by the existing git configuration |
+
+Verification uses only a newly initialized PostgreSQL 15.19 cluster on `127.0.0.1:55455`. `AI_PROVIDER=mock`, `PAYSTACK_TEST_ENABLED=false` and `LC_ALL=C` are explicit. All named databases are disposable, synthetic and owned by this run:
+
+```sh
+export DATABASE_URL='postgresql://override_test@127.0.0.1:55455/override_verified?schema=public'
+export TEST_DATABASE_URL='postgresql://override_test@127.0.0.1:55455/override_test?schema=public'
+export SHADOW_DATABASE_URL='postgresql://override_test@127.0.0.1:55455/override_shadow?schema=public'
+export AI_PROVIDER=mock PAYSTACK_TEST_ENABLED=false LC_ALL=C
+```
+
+Full command arguments/exit codes and logs are retained outside the repository in `/Users/apple/.codex/audit-artifacts/shortlet-phase6b1-2o5d89dp/` (`commands.jsonl`, test logs, `initial-failures.txt`, `probe-result.json`, `preservation-result.json`). The focused migration diagnostic used its own `override_focused` database; the migrate-dev probe used `override_probe` plus `override_shadow` and a temporary copy of schema/history. No application database URL from `.env` was used.
+
+Initial failures are part of the verification record:
+
+- `npm run build` and the first `npm test` passed (49 tests before the new tests were added).
+- `npx tsx --test --test-concurrency=1 test/integration/phase-six-a.test.ts test/integration/phase-six-b.test.ts` exited 1: new verified fixtures created an earlier audit row than the old test expected, and the new ownership CHECK rejected an invalid row before the older WhatsApp CHECK. Tests now select the correct actor and construct a valid proof when specifically testing the older constraint. Original security assertions remain.
+- The first `npm test` with ownership tests exited 1 (53 passed, one failed leaf plus its parent). The source-tree secret-file guard compared a canonical file path with a noncanonical root on macOS `/var` versus `/private/var`. Both are now canonicalized; the retained regression passes. One intermediate unit log was overwritten by its rerun; the command journal and `initial-failures.txt` retain the observed failure and correction.
+- `npx tsx --test --test-concurrency=1 test/integration/phase-six-a.test.ts test/integration/phase-six-b.test.ts test/integration/phase-six-b-one.test.ts test/integration/phase-six-b-migrations.test.ts` exited 1: a new duplicate-delivery fixture crossed the Lagos month boundary while expecting the previous month's ticket count. Its clock now remains in the intended month; separate month-boundary coverage remains.
+- The first complete `npm run test:integration` exited 1: the new migration fixture supplied a 2030 event timestamp but defaulted receipt time to today. The existing timestamp CHECK correctly rejected it. Both fixture timestamps are now explicit UTC values.
+- Two focused `npx tsx --test test/integration/phase-six-b-one-migrations.test.ts` diagnostic runs exited 1 at their final schema diff: they compared the random test namespace with a `public` target from the environment. Both sides now use the same isolated URL. Upgrade, atomic rollback/recovery and catalog/data-preservation assertions had passed before that diff. The corrected focused run exited 0.
+
+The actual future `prisma migrate dev` probe exited 0 and preserved **198 functions plus their security/owner/ACL records, 100 constraints, 8 enabled triggers, 105 indexes, and all 10 existing history entries**. It added only a temporary nullable probe column/migration in the external copy. The upgrade regression separately preserves every prior safeguard and verifies only the four new CHECKs are added. Baseline hashes confirm all nine historical SQL migration files, package files, real `.env`, conversation service/tools, booking service and payment service are unchanged (16 protected files).
+
+
+Final Phase 6B.1 verification completed (2026-11-02):
+
+| Exact verification command | Actual result |
+| --- | --- |
+| `npm run build` | Exit 0 |
+| `npm test` | Exit 0; **55 passed**, zero failures/skips/cancellations |
+| `npm run test:integration` | Exit 0; **193 passed**, zero failures/skips/cancellations; includes every Phase 1–6B suite and new ownership/upgrade regressions |
+| `npx prisma validate` | Exit 0 |
+| `npx prisma generate` | Exit 0 |
+| `npx prisma migrate deploy` | Exit 0; 10 migrations applied to the disposable verification DB; final repeat had no pending migrations |
+| `npx prisma migrate status` | Exit 0; database schema up to date |
+| `npx prisma migrate diff --from-url "$DATABASE_URL" --to-schema-datamodel prisma/schema.prisma --exit-code` | Exit 0; no difference detected |
+| `git diff --check` | Exit 0 |
+| `npm audit` | Exit 0; zero vulnerabilities |
+| `npm audit --omit=dev` | Exit 0; zero vulnerabilities |
+| `npm ls prisma @prisma/client @prisma/config deepmerge-ts` | Exit 0; Prisma/client/config 6.19.3 and overridden deepmerge-ts 8.0.2 |
+| `npx tsx --test test/integration/phase-six-b-one-migrations.test.ts` (corrected focused run) | Exit 0; populated upgrade, deliberate failure/rollback, recovery and schema/catalog preservation |
+| `npx prisma migrate dev --schema /Users/apple/.codex/audit-artifacts/shortlet-phase6b1-2o5d89dp/migration-probe/schema.prisma --name whatsapp_ownership_probe --skip-generate` | Exit 0; separate disposable probe and shadow databases; all SQL safeguards and prior history preserved |
+
+The initial complete integration run was **192 passed / 1 failed**, with no skips or cancellations; the fixture correction and successful full rerun are described above. New coverage adds six unit test records and ten integration test records (Node includes parent tests in these totals). Prior tests were retained and adapted only where the new verification/classification contract or migration boundary required it.
+
+`initdb -D <artifact-directory>/data -A trust -U override_test --encoding=UTF8 --locale=C`, `pg_ctl -D <artifact-directory>/data -l <artifact-directory>/postgres.log -o '-h 127.0.0.1 -p 55455 -k /tmp' -w start`, and `createdb -h 127.0.0.1 -p 55455 -U override_test <disposable-name>` all exited 0. `pg_ctl -D <artifact-directory>/data -m fast -w stop` exited 0; only this run's disposable data directory was then removed. Exact expanded arguments, including all database names and earlier failing commands, are in `commands.jsonl`. Logs and temporary probe files remain outside the repository for review.
+
+**No real Graph ownership test, real AI call, outbound WhatsApp message, live payment, production/valuable database mutation, commit, push, application deployment or Meta account-setting change occurred.** No dependency was added or changed. Production activation remains disabled. Phase 6C has not started.

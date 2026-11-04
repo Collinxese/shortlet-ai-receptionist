@@ -2,12 +2,21 @@ import 'dotenv/config';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readdir } from 'node:fs/promises';
+import { readdir, mkdtemp, cp, rm, readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { isolatedDatabase } from './database.js';
 const migration='20261102000100_whatsapp_inbound';
 const cli=(url:string,...args:string[])=>execFileSync(process.execPath,['node_modules/prisma/build/index.js',...args],{env:{...process.env,DATABASE_URL:url},stdio:'pipe',encoding:'utf8'});
 test('WhatsApp migration rejects ambiguous legacy mappings atomically and preserves data/history/SQL on recovery',async t=>{
  const c=await isolatedDatabase(t);
+ const directory=await mkdtemp(join(tmpdir(),'shortlet-inbound-migration-'));t.after(()=>rm(directory,{recursive:true,force:true}));
+ await cp('prisma',directory,{recursive:true});
+ for(const name of await readdir(join(directory,'migrations'))) if(name>migration && name!=='migration_lock.toml') await rm(join(directory,'migrations',name),{recursive:true,force:true});
+ const schemaPath=join(directory,'schema.prisma');
+ const schema=(await readFile(schemaPath,'utf8')).split('\n').filter(line=>!/^  (source String|whatsappState String|whatsappEnvironment String|verificationExpiresAt DateTime|credentialDigest String|verificationAttempt String)/.test(line)).join('\n');
+ await writeFile(schemaPath,schema);
+ const deploy=()=>cli(c.databaseUrl,'migrate','deploy','--schema',schemaPath);
  for(const name of (await readdir('prisma/migrations')).filter(n=>n<migration).sort()) {c.executeMigration(name);cli(c.databaseUrl,'migrate','resolve','--applied',name);}
  await c.db.$executeRaw`INSERT INTO "Tenant" (id,name,"updatedAt") VALUES ('meta-legacy-a','Legacy A',NOW()),('meta-legacy-b','Legacy B',NOW())`;
  await c.db.$executeRaw`INSERT INTO "ChannelConnection" (id,"tenantId",channel,"externalBusinessId","externalPhoneNumberId","isActive","updatedAt")
@@ -21,21 +30,21 @@ test('WhatsApp migration rejects ambiguous legacy mappings atomically and preser
   indexes:await c.db.$queryRaw<Array<{name:string;definition:string}>>`SELECT indexname AS name,indexdef AS definition FROM pg_indexes WHERE schemaname=current_schema() ORDER BY indexname`,
   triggers:await c.db.$queryRaw<Array<{name:string;definition:string;enabled:string}>>`SELECT t.tgname AS name,pg_get_triggerdef(t.oid) AS definition,t.tgenabled AS enabled FROM pg_trigger t JOIN pg_class r ON r.oid=t.tgrelid WHERE r.relnamespace=current_schema()::regnamespace AND NOT t.tgisinternal ORDER BY t.tgname`
  });
- const records=async()=>({connections:await c.db.channelConnection.findMany({orderBy:{id:'asc'}}),conversations:await c.db.conversation.findMany(),messages:await c.db.message.findMany()});
+ const records=async()=>({connections:await c.db.$queryRaw`SELECT * FROM "ChannelConnection" ORDER BY id`,conversations:await c.db.conversation.findMany(),messages:await c.db.message.findMany()});
  const before=await records(),sqlBefore=await catalog(),functionsBefore=await functions();
  const historyBefore=await c.db.$queryRaw<Array<{migration_name:string}>>`SELECT * FROM "_prisma_migrations" ORDER BY migration_name`;
  const assertRollback=async()=>{
   assert.deepEqual(await catalog(),sqlBefore);assert.deepEqual(await functions(),functionsBefore);
   const table=await c.db.$queryRaw<Array<{present:boolean}>>`SELECT to_regclass('"WhatsAppInbound"') IS NOT NULL AS present`;assert.equal(table[0]!.present,false);
  };
- assert.throws(c.deploy,/unique|duplicat|current transaction is aborted/i);await assertRollback();assert.deepEqual(await records(),before);
+ assert.throws(deploy,/unique|duplicat|current transaction is aborted/i);await assertRollback();assert.deepEqual(await records(),before);
  // Repair only disposable fixture data; inactive duplicate ownership is also ambiguous.
  await c.db.$executeRaw`UPDATE "ChannelConnection" SET "externalPhoneNumberId"='2002' WHERE id='legacy-meta-b'`;
  cli(c.databaseUrl,'migrate','resolve','--rolled-back',migration);
- assert.throws(c.deploy,/ChannelConnection_whatsapp_values|current transaction is aborted/);await assertRollback();
+ assert.throws(deploy,/ChannelConnection_whatsapp_values|current transaction is aborted/);await assertRollback();
  await c.db.$executeRaw`UPDATE "ChannelConnection" SET "isActive"=false WHERE id='legacy-meta-null'`;
  const repaired=await records();cli(c.databaseUrl,'migrate','resolve','--rolled-back',migration);
- assert.match(c.deploy(),/All migrations have been successfully applied/);assert.deepEqual(await records(),repaired);
+ assert.match(deploy(),/All migrations have been successfully applied/);assert.deepEqual(await records(),repaired);
  const after=await catalog();
  for(const key of ['constraints','triggers','indexes'] as const) for(const row of sqlBefore[key]) {
   if(key==='indexes' && row.name==='ChannelConnection_channel_externalBusinessId_key') continue;
@@ -48,6 +57,6 @@ test('WhatsApp migration rejects ambiguous legacy mappings atomically and preser
  const historyAfter=await c.db.$queryRaw<Array<{migration_name:string}>>`SELECT * FROM "_prisma_migrations" ORDER BY migration_name`;
  assert.deepEqual(historyAfter.filter(r=>r.migration_name!==migration),historyBefore);
  assert.equal(await c.db.whatsAppInbound.count(),0);
- assert.match(cli(c.databaseUrl,'migrate','status'),/Database schema is up to date/);
- const diff=cli(c.databaseUrl,'migrate','diff','--from-url',c.databaseUrl,'--to-schema-datamodel','prisma/schema.prisma','--exit-code');assert.match(diff,/No difference detected/);
+ assert.match(cli(c.databaseUrl,'migrate','status','--schema',schemaPath),/Database schema is up to date/);
+ const diff=cli(c.databaseUrl,'migrate','diff','--from-url',c.databaseUrl,'--to-schema-datamodel',schemaPath,'--exit-code');assert.match(diff,/No difference detected/);
 });

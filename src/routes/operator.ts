@@ -1,3 +1,4 @@
+import type { WhatsAppOwnership } from '../services/whatsapp-ownership.js';
 import { whatsappConnectionRoutes } from './whatsapp-connections.js';
 import { WhatsAppConnections } from '../services/whatsapp-connections.js';
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
@@ -25,7 +26,7 @@ declare module 'fastify' {
 }
 
 export const operatorRoutes: FastifyPluginAsync<{ db: PrismaClient; authentication: AuthenticationService; paymentProvider?: PaymentProvider;
-  conversationModel: ConversationModel; modelTimeoutMs: number; usageRuntime: UsageRuntime }> = async (app, options) => {
+  whatsappOwnership:WhatsAppOwnership; conversationModel: ConversationModel; modelTimeoutMs: number; usageRuntime: UsageRuntime }> = async (app, options) => {
   app.decorateRequest('auth', null);
   app.addHook('onRequest', async (request) => {
     request.auth = await options.authentication.authenticate(request.headers.authorization);
@@ -39,7 +40,7 @@ export const operatorRoutes: FastifyPluginAsync<{ db: PrismaClient; authenticati
   };
   const repository = (request: FastifyRequest) => new TenantRepository(options.db, requireAuth(request));
 
-  await app.register(whatsappConnectionRoutes, { service: r => new WhatsAppConnections(options.db, requireAuth(r)), permit });
+  await app.register(whatsappConnectionRoutes, { service: r => new WhatsAppConnections(options.db, requireAuth(r),options.whatsappOwnership), permit });
   await app.register(propertyRoutes, { repository, permit });
   await app.register(bookingRoutes, { service: (request) => new BookingService(options.db, requireAuth(request)), permit });
   await app.register(paymentRoutes, { service: (request) => new PaymentService(options.db, options.paymentProvider, requireAuth(request)), permit });

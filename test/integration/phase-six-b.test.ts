@@ -9,13 +9,15 @@ import { UsageService } from '../../src/services/usage-service.js';
 import { WhatsAppConnections } from '../../src/services/whatsapp-connections.js';
 import { WhatsAppWebhook } from '../../src/services/whatsapp-webhook.js';
 import { bodyDigest, identityDigest } from '../../src/services/whatsapp-validation.js';
+import { fixtureOwnership } from '../fixtures/whatsapp-ownership.js';
 import { isolatedDatabase } from './database.js';
 const secret='synthetic-meta-app-secret-fixture',token='synthetic-verify-token-fixture-00001';
 test('Phase 6B signed inbound delivery, isolation, atomic persistence and ledger integration',async t=>{
  const {db,databaseUrl,deploy}=await isolatedDatabase(t);deploy();
+ const ownership=fixtureOwnership();
  let now=new Date();let seq=0;const clock=()=>new Date(now);
  let calls=0;const app=await buildApp(loadConfig({NODE_ENV:'test',DATABASE_URL:databaseUrl,META_WEBHOOK_ENABLED:'true',META_APP_SECRET:secret,META_VERIFY_TOKEN:token}),
- {db,logger:false,conversationModel:{name:'mock',async plan(){calls++;throw new Error('MODEL_MUST_NOT_RUN');}}});t.after(()=>app.close());
+ {db,logger:false,whatsappOwnership:ownership,conversationModel:{name:'mock',async plan(){calls++;throw new Error('MODEL_MUST_NOT_RUN');}}});t.after(()=>app.close());
  const actors: Array<{auth:AuthContext;token:string}>=[];
  const actor=async(role:'OWNER'|'MANAGER'|'RECEPTIONIST',tenantId?:string)=>{
   const tenant=tenantId ?? (await db.tenant.create({data:{name:`Fixture ${++seq}`}})).id;
@@ -26,7 +28,13 @@ test('Phase 6B signed inbound delivery, isolation, atomic persistence and ledger
  };
  const a=await actor('OWNER'),b=await actor('OWNER'),manager=await actor('MANAGER',a.auth.user.tenantId),reception=await actor('RECEPTIONIST',a.auth.user.tenantId);
  const req=(method:'GET'|'POST'|'PATCH',path:string,who=a,payload?:object)=>app.inject({method,url:'/api'+path,headers:{authorization:`Bearer ${who.token}`},payload});
- const mapping=(who=a)=>new WhatsAppConnections(db,who.auth);
+ const mapping=(who=a)=>{
+  const service=new WhatsAppConnections(db,who.auth,ownership);
+  return {create:async(input:{phoneNumberId:string;businessId:string;isActive?:boolean})=>{
+   const row=await service.create({...input,isActive:false});await service.verify(row.id);
+   return input.isActive ? service.update(row.id,{isActive:true}):service.update(row.id,{isActive:false});
+  }};
+ };
  const first=await mapping().create({phoneNumberId:'2001',businessId:'1001',isActive:true});
  const other=await mapping(b).create({phoneNumberId:'2002',businessId:'1001',isActive:true});
  await new UsageService(db,a.auth).summary('SIMULATION');await new UsageService(db,b.auth).summary('SIMULATION');
@@ -35,7 +43,7 @@ test('Phase 6B signed inbound delivery, isolation, atomic persistence and ledger
  const payload=(v:object=value(),field='messages',business='1001')=>({object:'whatsapp_business_account',entry:[{id:business,changes:[{field,value:v}]}]});
  const sign=(raw:string)=>'sha256='+createHmac('sha256',secret).update(raw).digest('hex');
  const post=(p:unknown,signature?:string)=>{const raw=typeof p==='string'?p:JSON.stringify(p);return app.inject({method:'POST',url:'/api/webhooks/whatsapp',headers:{'content-type':'application/json','x-hub-signature-256':signature ?? sign(raw)},payload:raw});};
- const deliver=(p:unknown)=>{const raw=JSON.stringify(p);return new WhatsAppWebhook(db,secret,clock).receive(Buffer.from(raw),sign(raw));};
+ const deliver=(p:unknown)=>{const raw=JSON.stringify(p);return new WhatsAppWebhook(db,secret,clock,ownership).receive(Buffer.from(raw),sign(raw));};
  const counts=async()=>({conversations:await db.conversation.count(),messages:await db.message.count(),inbound:await db.whatsAppInbound.count(),usage:await db.usageInbound.count(),windows:await db.usageWindow.count(),audit:await db.auditLog.count()});
  const outcome=async(p:unknown)=>{const raw=typeof p==='string'?p:JSON.stringify(p);return (await db.webhookEvent.findUniqueOrThrow({where:{provider_eventId:{provider:'META_WHATSAPP',eventId:bodyDigest(raw)}}})).rawBody as {outcomes:Record<string,number>};};
  await t.test('GET subscription handshake returns exact challenge; wrong token, mode and query are safely rejected',async()=>{
@@ -107,7 +115,7 @@ test('Phase 6B signed inbound delivery, isolation, atomic persistence and ledger
  });
  await t.test('earlier processing clocks never shorten a window; exact expiry starts the next window',async()=>{
   const sender='2348097773333';await deliver(payload(value([message({from:sender})])));
-  const window=await db.usageWindow.findFirstOrThrow({where:{tenantId:a.auth.user.tenantId,identityHash:identityDigest([a.auth.user.tenantId,'WHATSAPP',`+${sender}`])}});
+  const window=await db.usageWindow.findFirstOrThrow({where:{tenantId:a.auth.user.tenantId,identityHash:identityDigest([identityDigest([a.auth.user.tenantId,'WHATSAPP',`+${sender}`]),'META_TEST'])}});
   const conversation=await db.conversation.findFirstOrThrow({where:{tenantId:a.auth.user.tenantId,guestPhone:`+${sender}`}});
   now=new Date(now.getTime()-1000);await deliver(payload(value([message({from:sender,timestamp:String(Math.floor(now.getTime()/1000)-864000)})])));
   assert.equal((await db.usageWindow.findUniqueOrThrow({where:{id:window.id}})).expiresAt.getTime(),window.expiresAt.getTime());
@@ -149,7 +157,7 @@ test('Phase 6B signed inbound delivery, isolation, atomic persistence and ledger
   for(const patch of [{tenantId:b.auth.user.tenantId},{phoneNumberId:'9999'},{encryptedCredential:'synthetic-hidden'}]) assert.equal((await req('PATCH',`/whatsapp/connections/${first.id}`,a,patch)).statusCode,400);
   await db.channelConnection.update({where:{id:first.id},data:{encryptedCredential:'synthetic-private-database-credential'}});
   const result=await req('GET','/whatsapp/connections');assert.ok(!result.body.includes('synthetic-private'));assert.ok(!result.body.includes('encryptedCredential'));
-  const audit=await db.auditLog.findFirstOrThrow({where:{action:'whatsapp.connection_updated',entityId:first.id}});assert.equal(audit.tenantId,a.auth.user.tenantId);assert.equal(audit.actorId,manager.auth.user.id);
+  const audit=await db.auditLog.findFirstOrThrow({where:{action:'whatsapp.connection_updated',entityId:first.id,actorId:manager.auth.user.id}});assert.equal(audit.tenantId,a.auth.user.tenantId);assert.equal(audit.actorId,manager.auth.user.id);
  });
  await t.test('audit failure rolls back messages, usage and conversations; durable RETRY succeeds on redelivery',async()=>{
   await db.$executeRawUnsafe(`CREATE FUNCTION fixture_fail_whatsapp_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action='whatsapp.message_received' THEN RAISE EXCEPTION 'synthetic-private-error'; END IF; RETURN NEW; END $$`);
@@ -167,15 +175,17 @@ test('Phase 6B signed inbound delivery, isolation, atomic persistence and ledger
   try{await assert.rejects(deliver(p),/WEBHOOK_RETRY_REQUIRED/);assert.deepEqual(await counts(),before);}finally{await db.$executeRawUnsafe('DROP TRIGGER fixture_fail_whatsapp_message ON "Message"');await db.$executeRawUnsafe('DROP FUNCTION fixture_fail_whatsapp_message()');}
   await deliver(p);assert.equal((await counts()).messages-before.messages,2);const after=await counts();await deliver(p);assert.deepEqual(await counts(),after);
  });
- await t.test('missing or exhausted usage configuration records inbound for staff and a BLOCKED receipt, never new quota',async()=>{
+ await t.test('Meta test channels remain identifiable and non-billable without consuming simulation or production allowances',async()=>{
   const c=await actor('OWNER');await mapping(c).create({phoneNumberId:'2006',businessId:'1001',isActive:true});
   await deliver(payload(value([message()], '2006')));
-  assert.equal(await db.usageWindow.count({where:{tenantId:c.auth.user.tenantId}}),0);
-  assert.equal((await db.usageInbound.findFirstOrThrow({where:{tenantId:c.auth.user.tenantId}})).status,'BLOCKED');
-  assert.equal((await db.whatsAppInbound.findFirstOrThrow({where:{tenantId:c.auth.user.tenantId}})).usageStatus,'BLOCKED');
-  assert.equal((await db.usageAlert.findFirstOrThrow({where:{tenantId:c.auth.user.tenantId}})).code,'USAGE_CONFIGURATION_MISSING');
+  assert.equal(await db.usageWindow.count({where:{tenantId:c.auth.user.tenantId,source:'META_TEST'}}),1);
+  assert.equal(await db.usageWindow.count({where:{tenantId:c.auth.user.tenantId,mode:'PRODUCTION'}}),0);
+  assert.equal((await db.usageInbound.findFirstOrThrow({where:{tenantId:c.auth.user.tenantId}})).status,'ACCEPTED');
+  assert.equal((await db.whatsAppInbound.findFirstOrThrow({where:{tenantId:c.auth.user.tenantId}})).usageStatus,'ACCEPTED');
+  assert.equal((await db.usageInbound.findFirstOrThrow({where:{tenantId:c.auth.user.tenantId}})).source,'META_TEST');
   await db.usagePolicy.update({where:{tenantId_mode:{tenantId:a.auth.user.tenantId,mode:'SIMULATION'}},data:{conversationAllowance:0}});
-  const before=await db.usageWindow.count();await deliver(payload(value([message({from:'2348099994444'})])));assert.equal(await db.usageWindow.count(),before);
+  const before=await db.usageWindow.count();await deliver(payload(value([message({from:'2348099994444'})])));assert.equal(await db.usageWindow.count(),before+1);
+  assert.equal((await new UsageService(db,a.auth).summary('SIMULATION')).conversations,0);
  });
  await t.test('missing configuration and unavailable database never return false success; health remains live',async()=>{
   const missing=new URL(databaseUrl);missing.pathname='/absent_phase6b_fixture';missing.searchParams.set('connect_timeout','1');
@@ -190,20 +200,20 @@ test('Phase 6B signed inbound delivery, isolation, atomic persistence and ledger
    assert.equal((await disabled.inject({method:'POST',url:'/api/webhooks/whatsapp',headers:{'content-type':'application/json'},payload:'{}'})).statusCode,503);
   } finally {await offline.close();await disabled.close();}
  });
- await t.test('processing across Lagos month boundary puts receipts and alerts in the same accounting period',async()=>{
+ await t.test('processing across Lagos month boundary puts receipts and test windows in the same accounting period',async()=>{
   const c=await actor('OWNER');await mapping(c).create({phoneNumberId:'2007',businessId:'1001',isActive:true});
   const received=new Date('2030-01-31T22:59:59Z'),processed=new Date('2030-01-31T23:00:01Z');let reads=0;
   const p=payload(value([message({timestamp:String(received.getTime()/1000)})],'2007')),raw=JSON.stringify(p);
-  await new WhatsAppWebhook(db,secret,()=>reads++===0 ? received:processed).receive(Buffer.from(raw),sign(raw));
-  const alert=await db.usageAlert.findFirstOrThrow({where:{tenantId:c.auth.user.tenantId}});
+  await new WhatsAppWebhook(db,secret,()=>reads++===0 ? received:processed,ownership).receive(Buffer.from(raw),sign(raw));
+  const window=await db.usageWindow.findFirstOrThrow({where:{tenantId:c.auth.user.tenantId}});
   const receipt=await db.usageInbound.findFirstOrThrow({where:{tenantId:c.auth.user.tenantId}});
-  assert.equal(receipt.receivedAt.toISOString(),processed.toISOString());assert.equal(alert.periodStart.toISOString(),'2030-01-31T23:00:00.000Z');
+  assert.equal(receipt.receivedAt.toISOString(),processed.toISOString());assert.equal(window.periodStart.toISOString(),'2030-01-31T23:00:00.000Z');
   assert.equal((await db.whatsAppInbound.findFirstOrThrow({where:{tenantId:c.auth.user.tenantId}})).receivedAt.toISOString(),received.toISOString());
  });
  await t.test('SQL uniqueness, immutable mapping ownership and composite child references reject cross-tenant writes',async()=>{
   await assert.rejects(db.channelConnection.update({where:{id:first.id},data:{tenantId:b.auth.user.tenantId}}),/WhatsApp_connection_identity_immutable/);
   await assert.rejects(db.channelConnection.create({data:{tenantId:b.auth.user.tenantId,channel:'WHATSAPP',externalBusinessId:'1009',externalPhoneNumberId:'2001'}}));
-  await assert.rejects(db.channelConnection.create({data:{tenantId:a.auth.user.tenantId,channel:'WHATSAPP',externalBusinessId:'1008',isActive:true}}),/ChannelConnection_whatsapp_values/);
+  await assert.rejects(db.channelConnection.create({data:{tenantId:a.auth.user.tenantId,channel:'WHATSAPP',externalBusinessId:'1008',isActive:true,whatsappState:'ACTIVE',whatsappEnvironment:'META_TEST',lastVerifiedAt:new Date(),verificationExpiresAt:new Date('2100-01-01'),credentialDigest:'a'.repeat(64)}}),/ChannelConnection_whatsapp_values/);
   const row=await db.whatsAppInbound.findFirstOrThrow({where:{tenantId:a.auth.user.tenantId}});
   await assert.rejects(db.whatsAppInbound.create({data:{...row,id:undefined,tenantId:b.auth.user.tenantId,metaMessageId:'wamid.foreign'}}));
   assert.equal(await db.message.count({where:{direction:'OUT'}}),0);assert.equal(await db.conversationTurn.count(),0);assert.equal(await db.usageEvent.count(),0);assert.equal(calls,0);
