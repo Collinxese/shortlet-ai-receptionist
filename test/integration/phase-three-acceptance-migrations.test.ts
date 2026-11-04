@@ -16,6 +16,11 @@ const migration = '20261025000200_booking_acceptance_guards';
 const cli = (databaseUrl: string, ...args: string[]) => execFileSync(process.execPath, ['node_modules/prisma/build/index.js', ...args], {
   env: { ...process.env, DATABASE_URL: databaseUrl }, stdio: 'pipe', encoding: 'utf8'
 });
+const cliWithShadow = (databaseUrl: string, shadowDatabaseUrl: string, ...args: string[]) =>
+  execFileSync(process.execPath, ['node_modules/prisma/build/index.js', ...args], {
+    env: { ...process.env, DATABASE_URL: databaseUrl, SHADOW_DATABASE_URL: shadowDatabaseUrl },
+    stdio: 'pipe', encoding: 'utf8'
+  });
 
 async function phaseThree(t: TestContext) {
   const context = await isolatedDatabase(t);
@@ -106,8 +111,8 @@ test('Prisma shadow replay and an appended generated migration preserve all SQL-
   await writeFile(schemaPath, originalSchema.replace('model Booking {', 'model Booking {\n  acceptanceAuditProbe String?'));
   // Match the model's default schema to the replay schema during diff. Different
   // generated schema names would describe a schema move rather than a new column.
-  const generated = cli(shadow.databaseUrl, 'migrate', 'diff', '--from-migrations', 'prisma/migrations',
-    '--to-schema-datamodel', schemaPath, '--shadow-database-url', shadow.databaseUrl, '--script');
+  const generated = cliWithShadow(target.databaseUrl, shadow.databaseUrl, 'migrate', 'diff', '--from-migrations', 'prisma/migrations',
+    '--to-schema-datamodel', schemaPath, '--schema', schemaPath, '--script');
   assert.match(generated, /ADD COLUMN\s+"acceptanceAuditProbe"\s+TEXT/);
   assert.doesNotMatch(generated, /DROP (?:TRIGGER|FUNCTION|CONSTRAINT|INDEX)/);
   const nextMigration = join(directory, 'migrations', '20261102000400_acceptance_probe');
