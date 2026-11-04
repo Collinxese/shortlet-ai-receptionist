@@ -110,14 +110,15 @@ test('Phase 6B.1 ownership boundary, trusted classification and disabled product
    import {GraphWhatsAppOwnership,MetaCredentialStore} from './src/services/whatsapp-ownership.ts';
    const {TEST_META_CREDENTIAL_FILE,TEST_META_APP_SECRET,TEST_META_ACCESS_TOKEN,TEST_DATABASE_URL,TEST_CONNECTION_ID,TEST_AUTH_TOKEN}=process.env;
    if(!TEST_META_CREDENTIAL_FILE||!TEST_META_APP_SECRET||!TEST_META_ACCESS_TOKEN||!TEST_DATABASE_URL||!TEST_CONNECTION_ID||!TEST_AUTH_TOKEN) throw new Error('Missing isolated child fixture environment');
+   if([TEST_META_CREDENTIAL_FILE,TEST_META_APP_SECRET,TEST_META_ACCESS_TOKEN,TEST_DATABASE_URL,TEST_CONNECTION_ID,TEST_AUTH_TOKEN]
+    .some(value=>[...process.argv,...process.execArgv].some(argument=>argument.includes(value))))
+    throw new Error('Child process arguments must not contain fixture credentials or identifiers');
    const verifier=new GraphWhatsAppOwnership(new MetaCredentialStore(TEST_META_CREDENTIAL_FILE),
     {appId:'3001',appSecret:TEST_META_APP_SECRET,version:'v23.0'},async()=>{throw new Error(TEST_META_ACCESS_TOKEN+TEST_META_APP_SECRET);});
    const app=await buildApp(loadConfig({NODE_ENV:'test',DATABASE_URL:TEST_DATABASE_URL}),{whatsappOwnership:verifier});
    try {const response=await app.inject({method:'POST',url:'/api/whatsapp/connections/'+TEST_CONNECTION_ID+'/verify',headers:{authorization:'Bearer '+TEST_AUTH_TOKEN}});
     console.log(response.statusCode,response.body);} finally {await app.close();}`;
   assert.ok(![file,secret,accessToken,databaseUrl,id,a.token].some(value=>script.includes(value)),'child source must not embed credentials or fixture identifiers');
-  assert.ok(![file,secret,accessToken,databaseUrl,id,a.token].some(value=>process.argv.some(argument=>argument.includes(value))),
-    'child-process arguments must not contain credentials or fixture identifiers');
   const output=execFileSync(process.execPath,['--import','tsx','--input-type=module','-e',script],{env:{...process.env,AI_PROVIDER:'mock',PAYSTACK_TEST_ENABLED:'false',
     TEST_META_CREDENTIAL_FILE:file,TEST_META_APP_SECRET:secret,TEST_META_ACCESS_TOKEN:accessToken+secret,TEST_DATABASE_URL:databaseUrl,
     TEST_CONNECTION_ID:id,TEST_AUTH_TOKEN:a.token},encoding:'utf8'});
