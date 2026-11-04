@@ -20,7 +20,7 @@ export async function isolatedDatabase(t: TestContext) {
   });
   await db.$executeRawUnsafe(`CREATE SCHEMA "${schema}"`);
   const cli = (...args: string[]) => execFileSync(process.execPath, ['node_modules/prisma/build/index.js', ...args], {
-    env: { ...process.env, DATABASE_URL: databaseUrl }, stdio: 'pipe', encoding: 'utf8'
+    env: { ...process.env, DATABASE_URL: databaseUrl, SHADOW_DATABASE_URL: databaseUrl }, stdio: 'pipe', encoding: 'utf8'
   });
   const executeMigration = (name: string) => cli('db', 'execute', '--schema', 'prisma/schema.prisma', '--file', `prisma/migrations/${name}/migration.sql`);
   return { db, schema, databaseUrl, executeMigration, deploy: () => cli('migrate', 'deploy') };
