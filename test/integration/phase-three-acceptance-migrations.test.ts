@@ -108,10 +108,15 @@ test('Prisma shadow replay and an appended generated migration preserve all SQL-
   await cp('prisma/migrations', join(directory, 'migrations'), { recursive: true });
   const schemaPath = join(directory, 'schema.prisma');
   // Test-only nullable column in a temporary schema copy, never a product change.
-  await writeFile(schemaPath, originalSchema.replace('model Booking {', 'model Booking {\n  acceptanceAuditProbe String?'));
+  const schemaWithShadow = originalSchema.replace(
+    /(\n\s+url\s*=\s*env\("DATABASE_URL"\))/,
+    '$1\n  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")'
+  );
+  assert.notEqual(schemaWithShadow, originalSchema, 'temporary schema must define shadow URL through environment');
+  await writeFile(schemaPath, schemaWithShadow.replace('model Booking {', 'model Booking {\n  acceptanceAuditProbe String?'));
   // Match the model's default schema to the replay schema during diff. Different
   // generated schema names would describe a schema move rather than a new column.
-  const generated = cliWithShadow(shadow.databaseUrl, shadow.databaseUrl, 'migrate', 'diff', '--from-migrations', 'prisma/migrations',
+  const generated = cliWithShadow(target.databaseUrl, shadow.databaseUrl, 'migrate', 'diff', '--from-migrations', 'prisma/migrations',
     '--to-schema-datamodel', schemaPath, '--schema', schemaPath, '--script');
   assert.match(generated, /ADD COLUMN\s+"acceptanceAuditProbe"\s+TEXT/);
   assert.doesNotMatch(generated, /DROP (?:TRIGGER|FUNCTION|CONSTRAINT|INDEX)/);
