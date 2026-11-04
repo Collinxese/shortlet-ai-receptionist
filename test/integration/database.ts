@@ -8,6 +8,15 @@ export async function isolatedDatabase(t: TestContext) {
   assert.ok(process.env.TEST_DATABASE_URL, 'Set TEST_DATABASE_URL to a disposable PostgreSQL test database.');
   const url = new URL(process.env.TEST_DATABASE_URL);
   assert.ok(['postgres:', 'postgresql:'].includes(url.protocol));
+  if (process.env.DATABASE_URL) {
+    const applicationUrl = new URL(process.env.DATABASE_URL);
+    const sameDatabase = url.protocol === applicationUrl.protocol &&
+      url.hostname === applicationUrl.hostname &&
+      url.port === applicationUrl.port &&
+      url.pathname === applicationUrl.pathname;
+    assert.ok(!sameDatabase,
+      'TEST_DATABASE_URL must target a different PostgreSQL database from DATABASE_URL; a separate schema in the application database is not sufficient.');
+  }
   const schema = `phase2_test_${randomBytes(8).toString('hex')}`;
   url.searchParams.set('schema', schema);
   const databaseUrl = url.toString();
