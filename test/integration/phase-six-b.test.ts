@@ -10,6 +10,7 @@ import { WhatsAppConnections } from '../../src/services/whatsapp-connections.js'
 import { WhatsAppWebhook } from '../../src/services/whatsapp-webhook.js';
 import { bodyDigest, identityDigest } from '../../src/services/whatsapp-validation.js';
 import { fixtureOwnership } from '../fixtures/whatsapp-ownership.js';
+import { unavailableDatabase } from '../fixtures/unavailable-database.js';
 import { isolatedDatabase } from './database.js';
 const secret='synthetic-meta-app-secret-fixture',token='synthetic-verify-token-fixture-00001';
 test('Phase 6B signed inbound delivery, isolation, atomic persistence and ledger integration',async t=>{
@@ -188,9 +189,8 @@ test('Phase 6B signed inbound delivery, isolation, atomic persistence and ledger
   assert.equal((await new UsageService(db,a.auth).summary('SIMULATION')).conversations,0);
  });
  await t.test('missing configuration and unavailable database never return false success; health remains live',async()=>{
-  const missing=new URL(databaseUrl);missing.pathname='/absent_phase6b_fixture';missing.searchParams.set('connect_timeout','1');
-  const offline=await buildApp(loadConfig({NODE_ENV:'test',DATABASE_URL:missing.toString(),META_WEBHOOK_ENABLED:'true',META_APP_SECRET:secret,META_VERIFY_TOKEN:token}),{logger:false});
-  const disabled=await buildApp(loadConfig({NODE_ENV:'test',DATABASE_URL:databaseUrl}),{logger:false});
+  const offline=await buildApp(loadConfig({NODE_ENV:'test',DATABASE_URL:'postgresql://unavailable.invalid/not-connected',META_WEBHOOK_ENABLED:'true',META_APP_SECRET:secret,META_VERIFY_TOKEN:token}),{db:unavailableDatabase(),logger:false});
+  const disabled=await buildApp(loadConfig({NODE_ENV:'test',DATABASE_URL:'postgresql://unavailable.invalid/not-connected'}),{db:unavailableDatabase(),logger:false});
   try {
    assert.equal((await offline.inject('/api/health')).statusCode,200);assert.equal((await offline.inject('/api/ready')).statusCode,503);
    const raw=JSON.stringify(payload(value([message({timestamp:String(Math.floor(Date.now()/1000))})])));
