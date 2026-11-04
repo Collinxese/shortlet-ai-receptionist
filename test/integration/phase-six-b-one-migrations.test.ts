@@ -13,7 +13,7 @@ test('ownership migration preserves legacy provenance and SQL; injected failure 
  const dir=await mkdtemp(join(tmpdir(),'ownership-migration-'));t.after(()=>rm(dir,{recursive:true,force:true}));
  await cp('prisma',dir,{recursive:true});const path=join(dir,'schema.prisma'),migrationPath=join(dir,'migrations',migration,'migration.sql');
  const sql=await readFile(migrationPath,'utf8');await rm(join(dir,'migrations',migration),{recursive:true});
- const cli=(...args:string[])=>execFileSync(process.execPath,['node_modules/prisma/build/index.js',...args,'--schema',path],{env:{...process.env,DATABASE_URL:c.databaseUrl,SHADOW_DATABASE_URL:c.databaseUrl},encoding:'utf8',stdio:'pipe'});
+ const cli=(...args:string[])=>execFileSync(process.execPath,['node_modules/prisma/build/index.js',...args,'--schema',path],{env:{...process.env,DATABASE_URL:c.databaseUrl},encoding:'utf8',stdio:'pipe'});
  cli('migrate','deploy');
  await db.$executeRaw`INSERT INTO "Tenant" (id,name,"updatedAt") VALUES ('legacy-owner','Legacy',NOW())`;
  await db.$executeRaw`INSERT INTO "ChannelConnection" (id,"tenantId",channel,"externalBusinessId","externalPhoneNumberId","isActive","lastVerifiedAt","updatedAt") VALUES ('legacy-connection','legacy-owner','WHATSAPP','1001','2001',true,NOW(),NOW())`;
