@@ -116,6 +116,8 @@ test('Phase 6B.1 ownership boundary, trusted classification and disabled product
    try {const response=await app.inject({method:'POST',url:'/api/whatsapp/connections/'+TEST_CONNECTION_ID+'/verify',headers:{authorization:'Bearer '+TEST_AUTH_TOKEN}});
     console.log(response.statusCode,response.body);} finally {await app.close();}`;
   assert.ok(![file,secret,accessToken,databaseUrl,id,a.token].some(value=>script.includes(value)),'child source must not embed credentials or fixture identifiers');
+  assert.ok(![file,secret,accessToken,databaseUrl,id,a.token].some(value=>process.argv.some(argument=>argument.includes(value))),
+    'child-process arguments must not contain credentials or fixture identifiers');
   const output=execFileSync(process.execPath,['--import','tsx','--input-type=module','-e',script],{env:{...process.env,AI_PROVIDER:'mock',PAYSTACK_TEST_ENABLED:'false',
     TEST_META_CREDENTIAL_FILE:file,TEST_META_APP_SECRET:secret,TEST_META_ACCESS_TOKEN:accessToken+secret,TEST_DATABASE_URL:databaseUrl,
     TEST_CONNECTION_ID:id,TEST_AUTH_TOKEN:a.token},encoding:'utf8'});
